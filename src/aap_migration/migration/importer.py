@@ -19,6 +19,35 @@ from aap_migration.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _inventory_kind_blocks_groups_and_hosts(kind: str | None) -> bool:
+    """True when the API does not allow creating groups or hosts on this inventory."""
+    return (kind or "") in ("smart", "constructed")
+
+
+async def _fetch_target_inventory_kind(
+    client: AAPTargetClient,
+    target_inventory_id: int,
+    *,
+    cache: dict[int, str | None] | None = None,
+) -> str | None:
+    """GET target inventory and return ``kind`` (cached when ``cache`` is provided)."""
+    if cache is not None and target_inventory_id in cache:
+        return cache[target_inventory_id]
+
+    try:
+        inv = await client.get_resource("inventory", target_inventory_id)
+    except APIError as first_err:
+        if first_err.status_code == 404:
+            inv = await client.get_resource("constructed_inventories", target_inventory_id)
+        else:
+            raise
+
+    kind = inv.get("kind")
+    if cache is not None:
+        cache[target_inventory_id] = kind
+    return kind
+
+
 class ResourceImporter:
     """Base class for importing resources to AAP 2.6.
 
@@ -455,9 +484,13 @@ class ResourceImporter:
 
                     # Update counters
                     if result:
-                        # Count managed/built-in types as success since mapping was successful
-                        # (_skipped means it was mapped but not patched because it's managed)
-                        success_count += 1
+                        # Policy skip (e.g. group on smart/constructed inventory): count as skipped
+                        if result.get("_skipped") and result.get("policy_skip"):
+                            skipped_count += 1
+                        else:
+                            # Count managed/built-in types as success since mapping was successful
+                            # (_skipped means it was mapped but not patched because it's managed)
+                            success_count += 1
                         results.append(result)
                     else:
                         # Result is None if skipped (already migrated) or failed
@@ -1211,6 +1244,22 @@ class InventoryGroupImporter(ResourceImporter):
     # Override the API endpoint since "groups" maps to "groups/" in AAP API
     API_ENDPOINT = "groups"
 
+    def __init__(
+        self,
+        client: AAPTargetClient,
+        state: MigrationState,
+        performance_config: PerformanceConfig,
+        resource_mappings: dict[str, dict[str, str]] | None = None,
+    ):
+        super().__init__(client, state, performance_config, resource_mappings)
+        self._inventory_kind_cache: dict[int, str | None] = {}
+
+    async def _get_target_inventory_kind(self, target_inventory_id: int) -> str | None:
+        """Fetch and cache inventory ``kind`` for the target (e.g. '', 'smart', 'constructed')."""
+        return await _fetch_target_inventory_kind(
+            self.client, target_inventory_id, cache=self._inventory_kind_cache
+        )
+
     async def import_resource(
         self,
         resource_type: str,
@@ -1240,6 +1289,36 @@ class InventoryGroupImporter(ResourceImporter):
         try:
             if resolve_dependencies:
                 data = await self._resolve_dependencies(resource_type, data)
+
+            target_inventory_id = data.get("inventory")
+            if target_inventory_id is not None:
+                try:
+                    kind = await self._get_target_inventory_kind(int(target_inventory_id))
+                except Exception as e:
+                    logger.warning(
+                        "inventory_kind_lookup_failed",
+                        target_inventory_id=target_inventory_id,
+                        source_id=source_id,
+                        error=str(e),
+                    )
+                    kind = None
+
+                if _inventory_kind_blocks_groups_and_hosts(kind):
+                    reason = (
+                        "Groups cannot be created for Smart or Constructed inventories "
+                        f"(target_inventory_id={target_inventory_id}, kind={kind!r})"
+                    )
+                    self.state.mark_skipped(resource_type, source_id, reason)
+                    self.stats["skipped_count"] += 1
+                    logger.info(
+                        "group_skipped_non_managed_inventory",
+                        resource_type=resource_type,
+                        source_id=source_id,
+                        group_name=data.get("name"),
+                        target_inventory_id=target_inventory_id,
+                        kind=kind,
+                    )
+                    return {"_skipped": True, "policy_skip": True, "name": data.get("name")}
 
             # Use correct API endpoint
             result = await self.client.create_resource(
@@ -1908,6 +1987,33 @@ class HostImporter(ResourceImporter):
             host_count=len(hosts),
             batch_size=batch_size,
         )
+
+        try:
+            inv_kind = await _fetch_target_inventory_kind(self.client, inventory_id)
+        except Exception as e:
+            logger.warning(
+                "inventory_kind_lookup_failed",
+                inventory_id=inventory_id,
+                error=str(e),
+            )
+            inv_kind = None
+
+        if _inventory_kind_blocks_groups_and_hosts(inv_kind):
+            self.stats["skipped_count"] += len(hosts)
+            logger.info(
+                "hosts_skipped_non_managed_inventory",
+                inventory_id=inventory_id,
+                host_count=len(hosts),
+                kind=inv_kind,
+                message="Hosts cannot be created for Smart or Constructed inventories",
+            )
+            return {
+                "total_requested": len(hosts),
+                "total_created": 0,
+                "total_failed": 0,
+                "total_skipped": len(hosts),
+                "results": [],
+            }
 
         all_results = []
         total_created = 0

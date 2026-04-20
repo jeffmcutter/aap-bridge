@@ -14,6 +14,7 @@ from aap_migration.config import PerformanceConfig
 from aap_migration.migration.importer import (
     CredentialImporter,
     HostImporter,
+    InventoryGroupImporter,
     InventoryImporter,
     JobTemplateImporter,
     OrganizationImporter,
@@ -36,6 +37,7 @@ def mock_client():
     client.get_all_resources_parallel = AsyncMock()
     client.bulk_create_resources = AsyncMock(return_value=[{"id": 100, "name": "Test Resource"}])
     client.get_workflow_nodes = AsyncMock(return_value=[])
+    client.get_resource = AsyncMock(return_value={"kind": "", "id": 1, "name": "Test Inventory"})
     return client
 
 
@@ -360,6 +362,43 @@ class TestHostImporter:
 
         # No hosts should be created
         assert host_importer.stats["skipped_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_import_hosts_bulk_skips_smart_inventory(self, host_importer, mock_client):
+        """Hosts cannot be created on smart/constructed inventories."""
+        mock_client.get_resource = AsyncMock(return_value={"kind": "smart", "id": 10})
+        host_importer.bulk_ops.bulk_create_hosts = AsyncMock()
+
+        hosts = [{"_source_id": 1, "name": "host-1", "enabled": True}]
+        result = await host_importer.import_hosts_bulk(inventory_id=10, hosts=hosts)
+
+        assert result["total_created"] == 0
+        assert result["total_skipped"] == 1
+        host_importer.bulk_ops.bulk_create_hosts.assert_not_called()
+
+
+class TestInventoryGroupImporter:
+    """Tests for InventoryGroupImporter."""
+
+    @pytest.fixture
+    def group_importer(self, mock_client, mock_state, performance_config):
+        return InventoryGroupImporter(mock_client, mock_state, performance_config)
+
+    @pytest.mark.asyncio
+    async def test_import_group_skips_smart_inventory(self, group_importer, mock_client, mock_state):
+        mock_state.is_migrated.return_value = False
+        mock_state.get_mapped_id.return_value = 99
+        mock_client.get_resource = AsyncMock(return_value={"kind": "smart", "id": 99})
+
+        result = await group_importer.import_resource(
+            resource_type="groups",
+            source_id=19,
+            data={"name": "g1", "inventory": 5},
+        )
+
+        assert result == {"_skipped": True, "policy_skip": True, "name": "g1"}
+        mock_client.create_resource.assert_not_called()
+        mock_state.mark_skipped.assert_called_once()
 
 
 class TestCredentialImporter:
