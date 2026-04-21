@@ -1665,7 +1665,7 @@ def import_cmd(
                             "inventory_groups": "import_inventory_groups",
                             # Job templates and workflows
                             "job_templates": "import_job_templates",
-                            "workflow_job_templates": "import_workflow_job_templates",
+                            "workflow_job_templates": "import_workflows",
                             "schedules": "import_schedules",
                             # Constructed inventories
                             "constructed_inventories": "import_constructed_inventories",
