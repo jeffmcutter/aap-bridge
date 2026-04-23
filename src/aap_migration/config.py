@@ -269,6 +269,28 @@ class PerformanceConfig(BaseModel):
         le=60,
         description="Interval (seconds) between project sync status checks",
     )
+    inventory_source_update_job_timeout_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=7200,
+        description="Timeout (seconds) waiting for each inventory_update job after import",
+    )
+    inventory_source_update_poll_interval_seconds: float = Field(
+        default=3.0,
+        ge=1.0,
+        le=60.0,
+        description="Interval (seconds) between inventory_update status polls",
+    )
+    inventory_source_sync_max_concurrent: int = Field(
+        default=5,
+        ge=1,
+        le=30,
+        description="Maximum concurrent inventory source update jobs after import",
+    )
+    inventory_source_sync_fail_on_job_failure: bool = Field(
+        default=False,
+        description="If true, abort migration when an inventory_update finishes unsuccessfully",
+    )
     project_patch_batch_size: int = Field(
         default=100,
         ge=1,
@@ -525,6 +547,23 @@ class ValidationConfig(BaseModel):
     )
 
 
+# Default execution environment names often skipped (platform / hub defaults)
+DEFAULT_SKIP_EXECUTION_ENVIRONMENT_NAMES: tuple[str, ...] = (
+    "Control Plane Execution Environment",
+    "Default execution environment",
+    "Hub Default execution environment",
+    "Hub Minimal execution environment",
+    "Minimal execution environment",
+)
+
+
+def normalized_execution_environment_skip_names(names: list[str] | None) -> frozenset[str]:
+    """Normalize EE display names for case-insensitive matching."""
+    if not names:
+        return frozenset()
+    return frozenset(s.strip().casefold() for s in names if s and str(s).strip())
+
+
 class ExportConfig(BaseModel):
     """Export configuration options."""
 
@@ -561,8 +600,17 @@ class ExportConfig(BaseModel):
     skip_hosts_with_inventory_sources: bool = Field(
         default=True,
         description=(
-            "Skip hosts managed by inventory sources (has_inventory_sources=true). "
-            "These hosts are recreated when the inventory source syncs on target."
+            "Export/transform: skip hosts managed by inventory sources (has_inventory_sources=true). "
+            "Import also skips bulk host/group create when the target inventory already has "
+            "inventory_sources (after they are migrated); run an inventory update on the target "
+            "to populate hosts and groups from SCM, Satellite, cloud, etc."
+        ),
+    )
+    skip_execution_environment_names: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_SKIP_EXECUTION_ENVIRONMENT_NAMES),
+        description=(
+            "Execution environment `name` values to omit from export and import "
+            "(case-insensitive). Edit this list in config; use [] to include all EEs."
         ),
     )
     records_per_file: int = Field(

@@ -14,6 +14,7 @@ from aap_migration.config import MigrationConfig
 from aap_migration.migration.checkpoint import CheckpointManager
 from aap_migration.migration.exporter import create_exporter
 from aap_migration.migration.importer import create_importer
+from aap_migration.migration.inventory_source_sync import sync_inventory_sources_after_import
 from aap_migration.migration.state import MigrationState
 from aap_migration.migration.transformer import SkipResourceError, create_transformer
 from aap_migration.reporting.live_progress import MigrationProgressDisplay
@@ -66,9 +67,21 @@ class MigrationCoordinator:
             "batch_size": 100,
         },
         {
+            "name": "projects",
+            "description": "Projects",
+            "resource_types": ["projects"],
+            "batch_size": 100,
+        },
+        {
             "name": "inventory",
             "description": "Inventories (80,000+ expected)",
             "resource_types": ["inventory"],
+            "batch_size": 100,
+        },
+        {
+            "name": "inventory_sources",
+            "description": "Inventory Sources (before constructed/smart-dependent inventories)",
+            "resource_types": ["inventory_sources"],
             "batch_size": 100,
         },
         {
@@ -78,35 +91,17 @@ class MigrationCoordinator:
             "batch_size": 100,
         },
         {
+            "name": "groups",
+            "description": "Inventory Groups",
+            "resource_types": ["groups"],
+            "batch_size": 100,
+        },
+        {
             "name": "hosts",
             "description": "Hosts (using bulk operations)",
             "resource_types": ["hosts"],
             "batch_size": 200,
             "use_bulk": True,
-        },
-        {
-            "name": "instances",
-            "description": "Instances (AAP Controller Nodes)",
-            "resource_types": ["instances"],
-            "batch_size": 50,
-        },
-        {
-            "name": "instance_groups",
-            "description": "Instance Groups",
-            "resource_types": ["instance_groups"],
-            "batch_size": 50,
-        },
-        {
-            "name": "projects",
-            "description": "Projects",
-            "resource_types": ["projects"],
-            "batch_size": 100,
-        },
-        {
-            "name": "inventory_config",
-            "description": "Inventory Sources and Groups",
-            "resource_types": ["inventory_sources", "groups"],
-            "batch_size": 100,
         },
         {
             "name": "notification_templates",
@@ -480,6 +475,7 @@ class MigrationCoordinator:
                 client=self.source_client,
                 state=self.state,
                 performance_config=self.config.performance,
+                skip_execution_environment_names=self.config.export.skip_execution_environment_names,
             )
 
             transformer = create_transformer(
@@ -494,6 +490,7 @@ class MigrationCoordinator:
                 state=self.state,
                 performance_config=self.config.performance,
                 resource_mappings=self.config.resource_mappings,
+                skip_execution_environment_names=self.config.export.skip_execution_environment_names,
             )
 
             # Special handling for hosts (bulk operations)
@@ -603,6 +600,7 @@ class MigrationCoordinator:
                 import_succeeded = 0  # Successful imports
                 import_failed = 0  # Failed imports
                 import_skipped = 0  # Already migrated (import-time skips)
+                inventory_source_ids_for_sync: list[int] = []
 
                 for resource in resources_to_import:
                     source_id = resource.pop("_source_id", None)
@@ -616,11 +614,27 @@ class MigrationCoordinator:
                     )
 
                     if result:
-                        stats["imported"] += 1
-                        import_succeeded += 1
-                        # Update progress
-                        if self.progress_tracker:
-                            self.progress_tracker.update_resource(imported=1)
+                        policy_skip = (
+                            isinstance(result, dict)
+                            and result.get("_skipped")
+                            and result.get("policy_skip")
+                        )
+                        if policy_skip:
+                            stats["skipped"] += 1
+                            import_skipped += 1
+                            if self.progress_tracker:
+                                self.progress_tracker.update_resource(skipped=1)
+                        else:
+                            stats["imported"] += 1
+                            import_succeeded += 1
+                            if (
+                                resource_type == "inventory_sources"
+                                and isinstance(result, dict)
+                                and result.get("id") is not None
+                            ):
+                                inventory_source_ids_for_sync.append(int(result["id"]))
+                            if self.progress_tracker:
+                                self.progress_tracker.update_resource(imported=1)
                     else:
                         # Check if it was a failure or just skipped (already imported)
                         if self.state.is_migrated(resource_type, source_id):
@@ -644,6 +658,18 @@ class MigrationCoordinator:
                             failed=stats["failed"],
                             skipped=stats["skipped"],
                         )
+
+                if resource_type == "inventory_sources" and inventory_source_ids_for_sync:
+                    logger.info(
+                        "inventory_sources_post_import_sync",
+                        count=len(inventory_source_ids_for_sync),
+                        message="Triggering inventory updates before later resource types",
+                    )
+                    await sync_inventory_sources_after_import(
+                        self.target_client,
+                        inventory_source_ids_for_sync,
+                        self.config.performance,
+                    )
 
                 # Report any import errors
                 if importer.import_errors:

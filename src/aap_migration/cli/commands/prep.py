@@ -230,7 +230,7 @@ def prep(ctx: MigrationContext, output_dir: Path, force: bool) -> None:
             save_comparison(comparison, comparison_file)
 
             # Use persistence module to save all schemas and comparison (REQ-002)
-            # Extract comparison objects from the comparison dict
+            # Build ComparisonResult objects (prep's transformation dict is not the same shape)
             from aap_migration.schema.models import ComparisonResult
             from aap_migration.schema.persistence import save_schemas
 

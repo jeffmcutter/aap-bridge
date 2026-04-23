@@ -13,7 +13,11 @@ from pathlib import Path
 
 import click
 
-from aap_migration.cli.commands.migrate import PHASE1_RESOURCE_TYPES, PHASE3_RESOURCE_TYPES
+from aap_migration.cli.commands.migrate import (
+    DEFAULT_MIGRATION_EXCLUDED_TYPES,
+    PHASE1_RESOURCE_TYPES,
+    PHASE2_RESOURCE_TYPES,
+)
 from aap_migration.cli.commands.patch_projects import patch_project_scm_details
 from aap_migration.cli.context import MigrationContext
 from aap_migration.cli.decorators import handle_errors, pass_context, requires_config
@@ -27,6 +31,10 @@ from aap_migration.cli.utils import (
 )
 from aap_migration.migration.exporter import create_exporter
 from aap_migration.migration.importer import create_importer
+from aap_migration.migration.inventory_source_sync import (
+    collect_inventory_source_target_ids_for_sync,
+    sync_inventory_sources_after_import,
+)
 from aap_migration.migration.parallel_exporter import ParallelExportCoordinator
 from aap_migration.migration.state import ExportRunContext, MigrationState
 from aap_migration.reporting.live_progress import MigrationProgressDisplay
@@ -62,7 +70,7 @@ def get_importer_dependencies(resource_type: str) -> dict[str, str]:
 
     Example:
         >>> get_importer_dependencies('inventory_sources')
-        {'inventory': 'inventories', 'source_project': 'projects', 'credential': 'credentials'}
+        {'inventory': 'inventory', 'source_project': 'projects', 'credential': 'credentials'}
     """
     try:
         # Create a dummy importer instance to access class-level DEPENDENCIES
@@ -88,7 +96,7 @@ def get_importer_dependencies(resource_type: str) -> dict[str, str]:
             WorkflowImporter,
         )
 
-        # Map resource types to importer classes
+        # Map resource types to importer classes (canonical + legacy aliases)
         importer_classes = {
             "organizations": OrganizationImporter,
             "labels": LabelImporter,
@@ -98,8 +106,10 @@ def get_importer_dependencies(resource_type: str) -> dict[str, str]:
             "credentials": CredentialImporter,
             "projects": ProjectImporter,
             "execution_environments": ExecutionEnvironmentImporter,
+            "inventory": InventoryImporter,
             "inventories": InventoryImporter,
             "inventory_sources": InventorySourceImporter,
+            "groups": InventoryGroupImporter,
             "inventory_groups": InventoryGroupImporter,
             "hosts": HostImporter,
             "job_templates": JobTemplateImporter,
@@ -324,7 +334,11 @@ def export(
     else:
         # No types specified - use discovered or hardcoded, then normalize
         discovered_types = get_exportable_types(use_discovered=True)
-        types_to_export = [normalize_resource_type(rt) for rt in discovered_types]
+        types_to_export = []
+        for rt in discovered_types:
+            nt = normalize_resource_type(rt)
+            if nt not in DEFAULT_MIGRATION_EXCLUDED_TYPES:
+                types_to_export.append(nt)
 
     # Check if parallel resource type export is enabled
     parallel_types_enabled = ctx.config.performance.parallel_resource_types
@@ -444,6 +458,7 @@ def export(
                         ctx.source_client,
                         ctx.migration_state,
                         ctx.config.performance,
+                        skip_execution_environment_names=ctx.config.export.skip_execution_environment_names,
                     )
                 except NotImplementedError as e:
                     # Exporter not implemented yet
@@ -517,7 +532,10 @@ def export(
                     def progress_callback(rtype: str, stats: dict):
                         phase_id = rtype  # We use resource_type as phase_id
                         progress.update_phase(
-                            phase_id, stats.get("exported", 0), stats.get("failed", 0)
+                            phase_id,
+                            stats.get("exported", 0),
+                            stats.get("failed", 0),
+                            stats.get("skipped", 0),
                         )
 
                     # Start all phases before parallel export begins
@@ -568,6 +586,7 @@ def export(
                             ctx.source_client,
                             ctx.migration_state,
                             ctx.config.performance,
+                            skip_execution_environment_names=ctx.config.export.skip_execution_environment_names,
                         )
 
                         # Apply skip_dynamic_hosts filter for hosts
@@ -660,8 +679,9 @@ def export(
                                 failed_count += 1
                                 resource_count += 1
 
-                            # Update progress (including failures)
-                            progress.update_phase(phase_id, resource_count, failed_count)
+                            # Update progress (exported + skipped from exporter, e.g. EE name filter)
+                            skip_ct = exporter.get_stats().get("skipped_count", 0)
+                            progress.update_phase(phase_id, resource_count, failed_count, skip_ct)
 
                             # Write batch when it reaches the limit
                             if len(current_batch) >= records_per_file:
@@ -678,6 +698,9 @@ def export(
                                 )
 
                                 current_batch = []
+
+                        skip_final = exporter.get_stats().get("skipped_count", 0)
+                        progress.update_phase(phase_id, resource_count, failed_count, skip_final)
 
                         # Commit remaining mappings
                         if pending_mappings:
@@ -837,7 +860,10 @@ def export(
     "--phase",
     type=click.Choice(["phase1", "phase2", "all"], case_sensitive=False),
     default="all",
-    help="Import phase: phase1 (up to projects), phase2 (patch projects and automation definitions), all (complete)",
+    help=(
+        "Import phase: phase1 (foundation through projects), "
+        "phase2 (patch projects then inventory + automation), all (complete)"
+    ),
 )
 @click.option(
     "-y",
@@ -915,17 +941,13 @@ def import_cmd(
         aap-bridge import --dry-run
 
         \b
-        # Three-phase import workflow:
-        # Phase 1: Import up to projects (Manual SCM)
+        # Two-phase import workflow:
+        # Phase 1: Import foundation through projects
         aap-bridge import --phase phase1
 
         \b
-        # Phase 2: Patch projects to activate SCM sync (controlled batching)
+        # Phase 2: Patch projects, then import inventory + automation
         aap-bridge import --phase phase2
-
-        \b
-        # Phase 3: Import job_templates and automation definitions
-        aap-bridge import --phase phase3
     """
     import logging
 
@@ -970,15 +992,16 @@ def import_cmd(
         echo_info("")
         raise click.ClickException("Import requires transformed data from xformed/ directory")
 
-    # Handle Phase 2 (Patch Projects) merged with Phase 3
+    # Handle Phase 2 (patch projects, then inventory + automation)
     if phase == "phase2":
         echo_info(
-            "Phase 2: Patching Projects + Importing Automation (Job Templates, Schedules, etc.)"
+            "Phase 2: Patching Projects + Importing Inventory & Automation (templates, schedules, …)"
         )
-        # Proceed to import Phase 3 resources after patching (logic handled in run_import)
 
     # Determine resource types to import
     available_types = list(metadata.get("resource_types", {}).keys())
+    if not resource_type:
+        available_types = [t for t in available_types if t not in DEFAULT_MIGRATION_EXCLUDED_TYPES]
     requested_types = list(resource_type) if resource_type else available_types
 
     # Check for missing prerequisite types (REQ-006)
@@ -988,14 +1011,15 @@ def import_cmd(
     for rtype in requested_types:
         deps = DEPENDENCY_MAP.get(rtype, [])
         for dep_type in deps:
-            # Check transformed metadata for dependency status
-            dep_meta = metadata.get("resource_types", {}).get(dep_type, {})
+            dep_key = normalize_resource_type(dep_type)
+            # Check transformed metadata for dependency status (keys use canonical names)
+            dep_meta = metadata.get("resource_types", {}).get(dep_key, {})
             # Either it wasn't in the metadata, or it had 0 transformed resources
             if not dep_meta or dep_meta.get("transformed_count", 0) == 0:
                 # Only warn if it's not already in id_mappings
-                if not ctx.migration_state.get_all_mappings(dep_type):
+                if not ctx.migration_state.get_all_mappings(dep_key):
                     missing_prerequisites.append(
-                        f"{rtype} requires {dep_type} (0 transformed resources available)"
+                        f"{rtype} requires {dep_key} (0 transformed resources available)"
                     )
 
     if missing_prerequisites:
@@ -1074,8 +1098,41 @@ def import_cmd(
         types_to_import = [t for t in types_to_import if t in PHASE1_RESOURCE_TYPES]
         logger.info("Phase 1 import: credential_types/credentials will be PATCHed (pre-created)")
     elif phase == "phase2":
-        # Phase 2 includes Phase 3 resources (merged)
-        types_to_import = [t for t in types_to_import if t in PHASE3_RESOURCE_TYPES]
+        types_to_import = [t for t in types_to_import if t in PHASE2_RESOURCE_TYPES]
+
+    if (
+        "inventory" in types_to_import
+        and "inventory_sources" in types_to_import
+        and "smart_inventories" not in types_to_import
+    ):
+        # Smart inventories should be created only after inventory source sync.
+        types_to_import.append("smart_inventories")
+
+    if phase == "phase1":
+        phase1_order = {rtype: idx for idx, rtype in enumerate(PHASE1_RESOURCE_TYPES)}
+        types_to_import = sorted(
+            types_to_import,
+            key=lambda t: phase1_order.get(t, 999),
+        )
+    elif phase == "phase2":
+        phase2_order = {rtype: idx for idx, rtype in enumerate(PHASE2_RESOURCE_TYPES)}
+        types_to_import = sorted(
+            types_to_import,
+            key=lambda t: phase2_order.get(t, 999),
+        )
+
+    if "smart_inventories" in types_to_import:
+        # Keep smart inventories directly after inventory_sources and before constructed.
+        stripped = [t for t in types_to_import if t != "smart_inventories"]
+        insert_idx = len(stripped)
+        if "inventory_sources" in stripped:
+            insert_idx = stripped.index("inventory_sources") + 1
+        elif "inventory" in stripped:
+            insert_idx = stripped.index("inventory") + 1
+        if "constructed_inventories" in stripped:
+            insert_idx = min(insert_idx, stripped.index("constructed_inventories"))
+        stripped.insert(insert_idx, "smart_inventories")
+        types_to_import = stripped
 
     # Force re-import: Clear import progress and reset target_ids
     if force_reimport:
@@ -1185,9 +1242,28 @@ def import_cmd(
         if not resources:
             return []
 
-        # Step 1: Clear target_ids to ensure we don't trust stale data
-        cleared_count = state.reset_target_ids(resource_type)
-        logger.info("cleared_target_ids", resource_type=resource_type, count=cleared_count)
+        # Constructed inventories use API type ``constructed_inventories`` but share the same
+        # source inventory IDs and id_mappings row type as ``inventory`` (see ConstructedInventoryImporter).
+        mapping_resource_type = (
+            "inventory" if resource_type == "constructed_inventories" else resource_type
+        )
+
+        # Step 1: Clear target_ids only for this batch's source rows so we do not wipe
+        # id_mappings for other resources of the same type imported in a prior step
+        # (e.g. static inventories vs. later smart_inventories both use resource_type inventory).
+        source_ids_for_reset = [
+            sid for r in resources if (sid := r.get("_source_id")) is not None
+        ]
+        cleared_count = state.reset_target_ids_for_source_ids(
+            mapping_resource_type, source_ids_for_reset
+        )
+        logger.info(
+            "cleared_target_ids",
+            resource_type=resource_type,
+            mapping_resource_type=mapping_resource_type,
+            count=cleared_count,
+            source_id_count=len(source_ids_for_reset),
+        )
 
         # Step 2: Get identifier field from importer
         identifier_field = getattr(importer, "IDENTIFIER_FIELD", "name")
@@ -1324,7 +1400,7 @@ def import_cmd(
                 existing = existing_by_identifier[lookup_key]
 
                 state.save_id_mapping(
-                    resource_type=resource_type,
+                    resource_type=mapping_resource_type,
                     source_id=source_id,
                     target_id=existing["id"],
                     source_name=identifier,
@@ -1366,6 +1442,7 @@ def import_cmd(
 
         # Track detailed stats per resource type
         run_stats = {}
+        split_smart_inventory_phase = "smart_inventories" in types_to_import
 
         # Initialize phases
         phases = []
@@ -1397,16 +1474,24 @@ def import_cmd(
 
             # For accurate counts, read actual file contents instead of metadata
             # (metadata count may not reflect post-transform splits like constructed inventories)
-            rtype_dir = input_dir / rtype
+            rtype_dir = input_dir / ("inventory" if rtype == "smart_inventories" else rtype)
             if rtype_dir.exists():
                 actual_count = 0
-                for json_file in sorted(rtype_dir.glob(f"{rtype}_*.json")):
+                file_prefix = "inventory" if rtype == "smart_inventories" else rtype
+                for json_file in sorted(rtype_dir.glob(f"{file_prefix}_*.json")):
                     try:
                         with open(json_file) as f:
-                            actual_count += len(json.load(f))
+                            rows = json.load(f)
+                            if split_smart_inventory_phase and rtype == "smart_inventories":
+                                rows = [r for r in rows if (r.get("kind") or "") == "smart"]
+                            elif split_smart_inventory_phase and rtype == "inventory":
+                                rows = [r for r in rows if (r.get("kind") or "") != "smart"]
+                            actual_count += len(rows)
                     except Exception:
                         pass
-                if actual_count > 0:
+                if split_smart_inventory_phase and rtype in ("inventory", "smart_inventories"):
+                    count = actual_count
+                elif actual_count > 0:
                     count = actual_count
 
             description = rtype.replace("_", " ").title()
@@ -1445,8 +1530,9 @@ def import_cmd(
                     # Load resume cache if resume mode is enabled
                     imported_source_ids_cache = set()
                     if resume:
+                        cache_type = "inventory" if rtype == "smart_inventories" else rtype
                         imported_source_ids_cache = ctx.migration_state.get_imported_source_ids(
-                            rtype
+                            cache_type
                         )
                         if imported_source_ids_cache:
                             logger.info(
@@ -1456,14 +1542,15 @@ def import_cmd(
                             )
 
                     # Load all files for this resource type
-                    resource_dir = input_dir / rtype
+                    resource_dir = input_dir / ("inventory" if rtype == "smart_inventories" else rtype)
                     if not resource_dir.exists():
                         echo_warning(f"No directory for {rtype}, skipping")
                         progress.complete_phase(phase_id)
                         continue
 
                     # Find all JSON files for this resource type
-                    json_files = sorted(resource_dir.glob(f"{rtype}_*.json"))
+                    file_prefix = "inventory" if rtype == "smart_inventories" else rtype
+                    json_files = sorted(resource_dir.glob(f"{file_prefix}_*.json"))
 
                     if not json_files:
                         echo_warning(f"No files found for {rtype}, skipping")
@@ -1482,6 +1569,10 @@ def import_cmd(
                             continue
 
                     resources = all_resources
+                    if split_smart_inventory_phase and rtype == "smart_inventories":
+                        resources = [r for r in all_resources if (r.get("kind") or "") == "smart"]
+                    elif split_smart_inventory_phase and rtype == "inventory":
+                        resources = [r for r in all_resources if (r.get("kind") or "") != "smart"]
                     if not resources:
                         echo_warning(f"No {rtype} to import, skipping")
                         progress.complete_phase(phase_id)
@@ -1500,7 +1591,10 @@ def import_cmd(
                         # Fallback: Look up source_id from database by name if missing
                         if source_id is None:
                             resource_name = resource.get("name", "")
-                            mapping = ctx.migration_state.get_mapping_by_name(rtype, resource_name)
+                            mapping_type = "inventory" if rtype == "smart_inventories" else rtype
+                            mapping = ctx.migration_state.get_mapping_by_name(
+                                mapping_type, resource_name
+                            )
                             if mapping:
                                 source_id = mapping.source_id
                                 resource["_source_id"] = source_id
@@ -1523,12 +1617,14 @@ def import_cmd(
                     if not dry_run:
                         # Create appropriate importer using factory
                         try:
+                            importer_resource_type = "inventory" if rtype == "smart_inventories" else rtype
                             importer = create_importer(
-                                rtype,
+                                importer_resource_type,
                                 ctx.target_client,
                                 ctx.migration_state,
                                 ctx.config.performance,
                                 ctx.config.resource_mappings,
+                                skip_execution_environment_names=ctx.config.export.skip_execution_environment_names,
                             )
                         except NotImplementedError:
                             logger.info(
@@ -1560,13 +1656,16 @@ def import_cmd(
                             # Projects and execution
                             "projects": "import_projects",
                             "execution_environments": "import_execution_environments",
-                            # Inventory resources
+                            # Inventory resources (canonical names + legacy aliases)
+                            "inventory": "import_inventories",
                             "inventories": "import_inventories",
+                            "smart_inventories": "import_inventories",
                             "inventory_sources": "import_inventory_sources",
+                            "groups": "import_inventory_groups",
                             "inventory_groups": "import_inventory_groups",
                             # Job templates and workflows
                             "job_templates": "import_job_templates",
-                            "workflow_job_templates": "import_workflow_job_templates",
+                            "workflow_job_templates": "import_workflows",
                             "schedules": "import_schedules",
                             # Constructed inventories
                             "constructed_inventories": "import_constructed_inventories",
@@ -1582,7 +1681,7 @@ def import_cmd(
                             # Proactive batch pre-check: query target to find existing resources
                             # This avoids "already exists" errors and shows accurate progress
                             resources_to_import = await batch_precheck_resources(
-                                resource_type=rtype,
+                                resource_type=importer_resource_type,
                                 resources=transformed_resources,
                                 importer=importer,
                                 client=ctx.target_client,
@@ -1594,6 +1693,7 @@ def import_cmd(
                             # Calculate skipped count (resources that already exist)
                             skipped_count = len(transformed_resources) - len(resources_to_import)
 
+                            results = None
                             if resources_to_import:
                                 # Create progress callback for live updates
                                 def update_progress(
@@ -1637,6 +1737,33 @@ def import_cmd(
                                     resource_type=rtype,
                                     total=len(transformed_resources),
                                 )
+
+                            # Constructed inventories: batch pre-check can skip every row (already on target),
+                            # so import_constructed_inventories never runs and input_inventories are never POSTed.
+                            # Always reconcile M2M from the full transformed list after pre-check updates mappings.
+                            if (
+                                rtype == "constructed_inventories"
+                                and not dry_run
+                                and transformed_resources
+                                and hasattr(importer, "sync_input_inventories_for_constructed_resources")
+                            ):
+                                await importer.sync_input_inventories_for_constructed_resources(
+                                    transformed_resources
+                                )
+
+                            if rtype == "inventory_sources" and results:
+                                sync_ids = collect_inventory_source_target_ids_for_sync(results)
+                                if sync_ids:
+                                    logger.info(
+                                        "inventory_sources_post_import_sync",
+                                        count=len(sync_ids),
+                                        message="Triggering inventory updates before constructed inventories",
+                                    )
+                                    await sync_inventory_sources_after_import(
+                                        ctx.target_client,
+                                        sync_ids,
+                                        ctx.config.performance,
+                                    )
 
                             # NOTE: SCM sync waiting has been removed from automatic flow.
                             # With two-phase import, users run phase1 (up to projects),

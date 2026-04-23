@@ -11,12 +11,111 @@ from typing import Any
 from aap_migration.client.aap_target_client import AAPTargetClient
 from aap_migration.client.bulk_operations import BulkOperations
 from aap_migration.client.exceptions import APIError, ConflictError
-from aap_migration.config import PerformanceConfig
+from aap_migration.config import PerformanceConfig, normalized_execution_environment_skip_names
 from aap_migration.migration.state import MigrationState
+from aap_migration.resources import get_endpoint, normalize_resource_type
 from aap_migration.utils.idempotency import compare_resources
+from aap_migration.utils.inventory_fk import (
+    ensure_credential_id_on_inventory_source,
+    ensure_inventory_id_on_inventory_source,
+    normalize_input_inventories_to_source_ids,
+    parse_credential_id_from_api_value,
+    parse_inventory_id_from_api_value,
+)
 from aap_migration.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _inventory_kind_blocks_groups_and_hosts(kind: str | None) -> bool:
+    """True when the API does not allow creating groups or hosts on this inventory."""
+    return (kind or "") in ("smart", "constructed")
+
+
+async def _fetch_target_inventory_kind(
+    client: AAPTargetClient,
+    target_inventory_id: int,
+    *,
+    cache: dict[int, str | None] | None = None,
+) -> str | None:
+    """GET target inventory and return ``kind`` (cached when ``cache`` is provided)."""
+    if cache is not None and target_inventory_id in cache:
+        return cache[target_inventory_id]
+
+    try:
+        inv = await client.get_resource("inventory", target_inventory_id)
+    except APIError as first_err:
+        if first_err.status_code == 404:
+            inv = await client.get_resource("constructed_inventories", target_inventory_id)
+        else:
+            raise
+
+    kind = inv.get("kind")
+    if cache is not None:
+        cache[target_inventory_id] = kind
+    return kind
+
+
+def _inventory_sources_list_has_items(resp: dict[str, Any]) -> bool:
+    """Interpret a list response from inventory_sources (count and/or results)."""
+    total = resp.get("count")
+    if total is not None:
+        return total > 0
+    return len(resp.get("results", [])) > 0
+
+
+async def _fetch_target_inventory_has_inventory_sources(
+    client: AAPTargetClient,
+    target_inventory_id: int,
+    *,
+    cache: dict[int, bool] | None = None,
+) -> bool:
+    """True if the target inventory has at least one inventory source (sync-managed content).
+
+    Uses ``GET inventories/<id>/inventory_sources/`` (same as the API ``related`` link) so the
+    result is scoped to that inventory. Some deployments mishandle the legacy query
+    ``inventory_sources/?inventory=<id>``, which can return an unfiltered list and make every
+    inventory look sync-managed — causing all hosts and groups to be skipped.
+    """
+    if cache is not None and target_inventory_id in cache:
+        return cache[target_inventory_id]
+
+    inv_base = get_endpoint("inventory").rstrip("/")
+    nested_endpoint = f"{inv_base}/{target_inventory_id}/inventory_sources/"
+
+    resp: dict[str, Any] | None = None
+    try:
+        resp = await client.get(nested_endpoint, params={"page_size": 1})
+    except Exception as e:
+        logger.debug(
+            "inventory_sources_nested_lookup_failed_trying_flat",
+            target_inventory_id=target_inventory_id,
+            error=str(e),
+        )
+
+    if resp is None:
+        endpoint = get_endpoint("inventory_sources")
+        if not endpoint.endswith("/"):
+            endpoint = f"{endpoint}/"
+        try:
+            resp = await client.get(
+                endpoint,
+                params={"inventory": target_inventory_id, "page_size": 1},
+            )
+        except Exception as e:
+            logger.warning(
+                "inventory_sources_lookup_failed",
+                target_inventory_id=target_inventory_id,
+                error=str(e),
+            )
+            if cache is not None:
+                cache[target_inventory_id] = False
+            return False
+
+    has_sources = _inventory_sources_list_has_items(resp)
+    if cache is not None:
+        cache[target_inventory_id] = has_sources
+    return has_sources
 
 
 class ResourceImporter:
@@ -101,12 +200,34 @@ class ResourceImporter:
             if resolve_dependencies:
                 data = await self._resolve_dependencies(resource_type, data)
 
+            if normalize_resource_type(resource_type) == "inventory_sources" and not data.get(
+                "inventory"
+            ):
+                reason = (
+                    "Skipped inventory source: no parent inventory FK (null/unmapped). "
+                    "Often auto-created; not required to recreate on target."
+                )
+                self.state.mark_skipped(resource_type, source_id, reason)
+                self.stats["skipped_count"] += 1
+                logger.info(
+                    "inventory_source_skipped_no_inventory_fk",
+                    resource_type=resource_type,
+                    source_id=source_id,
+                    source_name=data.get("name"),
+                )
+                return {"_skipped": True, "policy_skip": True, "name": data.get("name")}
+
             # Remove None/null values from data before API call
             # AAP 2.6 API requires null-valued fields to be absent, not sent as null
             # EXCEPTION: Preserve None for credential ownership fields (organization/user/team)
             # Credentials require at least one ownership field, even if None
             ownership_fields = {"user", "team"}
-            data = {k: v for k, v in data.items() if v is not None or k in ownership_fields}
+            data = {
+                k: v
+                for k, v in data.items()
+                if (v is not None or k in ownership_fields)
+                and not (isinstance(k, str) and k.startswith("_"))
+            }
 
             # Create resource
             result = await self.client.create_resource(
@@ -222,6 +343,34 @@ class ResourceImporter:
 
             return None
 
+    async def _post_survey_spec_after_create(
+        self,
+        resource_type: str,
+        target_id: int,
+        survey_spec: dict[str, Any],
+        *,
+        template_name: str | None = None,
+    ) -> None:
+        """POST survey body to ``…/{id}/survey_spec/`` after the template exists."""
+        base = get_endpoint(resource_type).rstrip("/")
+        endpoint = f"{base}/{target_id}/survey_spec/"
+        try:
+            await self.client.post(endpoint, json_data=survey_spec)
+            logger.info(
+                "survey_spec_imported",
+                resource_type=resource_type,
+                target_id=target_id,
+                template_name=template_name,
+            )
+        except Exception as e:
+            logger.error(
+                "survey_spec_import_failed",
+                resource_type=resource_type,
+                target_id=target_id,
+                template_name=template_name,
+                error=str(e),
+            )
+
     async def _resolve_dependencies(
         self, resource_type: str, data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -234,6 +383,10 @@ class ResourceImporter:
         Returns:
             Data with resolved dependencies
         """
+        if normalize_resource_type(resource_type) == "inventory_sources":
+            ensure_inventory_id_on_inventory_source(data)
+            ensure_credential_id_on_inventory_source(data)
+
         resolved = dict(data)
         dependencies = self._get_dependencies(resource_type)
         resource_source_id = data.get("_source_id") or data.get("id")
@@ -250,6 +403,18 @@ class ResourceImporter:
         for field, dep_resource_type in dependencies.items():
             if field in data and data[field]:
                 dep_source_id = data[field]
+                if dep_resource_type == "inventory":
+                    coerced = parse_inventory_id_from_api_value(dep_source_id)
+                    if coerced is not None:
+                        dep_source_id = coerced
+                elif dep_resource_type == "credentials":
+                    coerced = parse_credential_id_from_api_value(dep_source_id)
+                    if coerced is not None:
+                        dep_source_id = coerced
+                try:
+                    dep_source_id = int(dep_source_id)
+                except (TypeError, ValueError):
+                    pass
 
                 logger.debug(
                     "resolving_dependency_field",
@@ -273,6 +438,16 @@ class ResourceImporter:
                     target_id=target_id,
                     found=target_id is not None,
                 )
+
+                if (
+                    not target_id
+                    and normalize_resource_type(resource_type) == "inventory_sources"
+                    and field == "credential"
+                    and dep_resource_type == "credentials"
+                ):
+                    target_id = await self._resolve_inventory_source_credential_target(
+                        data, dep_source_id
+                    )
 
                 if target_id:
                     resolved[field] = target_id
@@ -313,6 +488,76 @@ class ResourceImporter:
                     resolved.pop(field, None)
 
         return resolved
+
+    async def _resolve_inventory_source_credential_target(
+        self,
+        data: dict[str, Any],
+        dep_source_id: int | Any,
+    ) -> int | None:
+        """Resolve credential FK when ``credentials:<source_id>`` is missing from id_mappings.
+
+        Cloud inventory sources require ``credential`` on create. Fallbacks:
+
+        1. ``get_mapped_id_by_name`` using ``_credential_lookup_name`` from transform
+           (matches :attr:`IDMapping.source_name` from credential import).
+        2. ``GET credentials/?name=…&organization__name=…`` on the target (pre-created creds).
+        """
+        name = data.get("_credential_lookup_name")
+        if not name:
+            logger.warning(
+                "inventory_source_credential_no_lookup_name",
+                inventory_source_name=data.get("name"),
+                dep_source_id=dep_source_id,
+                message="Re-transform inventory_sources so summary_fields.credential.name is captured",
+            )
+            return None
+
+        tid = self.state.get_mapped_id_by_name("credentials", name)
+        if tid:
+            logger.info(
+                "inventory_source_credential_resolved_by_mapping_source_name",
+                credential_name=name,
+                target_id=tid,
+            )
+            return tid
+
+        org_name = data.get("_inventory_source_organization_name")
+        try:
+            found = await self.client.find_resource_by_name(
+                "credentials",
+                name,
+                organization=org_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "inventory_source_credential_target_lookup_failed",
+                credential_name=name,
+                organization=org_name,
+                error=str(e),
+            )
+            return None
+
+        if found:
+            tid = int(found["id"])
+            logger.info(
+                "inventory_source_credential_resolved_by_target_api",
+                credential_name=name,
+                target_id=tid,
+                organization=org_name,
+            )
+            try:
+                sid = int(dep_source_id)
+                self.state.save_id_mapping(
+                    resource_type="credentials",
+                    source_id=sid,
+                    target_id=tid,
+                    source_name=name,
+                    target_name=found.get("name"),
+                )
+            except (TypeError, ValueError):
+                pass
+            return tid
+        return None
 
     def _get_dependencies(self, resource_type: str) -> dict[str, str]:
         """Get dependency mapping for resource type.
@@ -455,9 +700,13 @@ class ResourceImporter:
 
                     # Update counters
                     if result:
-                        # Count managed/built-in types as success since mapping was successful
-                        # (_skipped means it was mapped but not patched because it's managed)
-                        success_count += 1
+                        # Policy skip (e.g. group on smart/constructed inventory): count as skipped
+                        if result.get("_skipped") and result.get("policy_skip"):
+                            skipped_count += 1
+                        else:
+                            # Count managed/built-in types as success since mapping was successful
+                            # (_skipped means it was mapped but not patched because it's managed)
+                            success_count += 1
                         results.append(result)
                     else:
                         # Result is None if skipped (already migrated) or failed
@@ -1211,6 +1460,23 @@ class InventoryGroupImporter(ResourceImporter):
     # Override the API endpoint since "groups" maps to "groups/" in AAP API
     API_ENDPOINT = "groups"
 
+    def __init__(
+        self,
+        client: AAPTargetClient,
+        state: MigrationState,
+        performance_config: PerformanceConfig,
+        resource_mappings: dict[str, dict[str, str]] | None = None,
+    ):
+        super().__init__(client, state, performance_config, resource_mappings)
+        self._inventory_kind_cache: dict[int, str | None] = {}
+        self._inventory_has_sources_cache: dict[int, bool] = {}
+
+    async def _get_target_inventory_kind(self, target_inventory_id: int) -> str | None:
+        """Fetch and cache inventory ``kind`` for the target (e.g. '', 'smart', 'constructed')."""
+        return await _fetch_target_inventory_kind(
+            self.client, target_inventory_id, cache=self._inventory_kind_cache
+        )
+
     async def import_resource(
         self,
         resource_type: str,
@@ -1240,6 +1506,68 @@ class InventoryGroupImporter(ResourceImporter):
         try:
             if resolve_dependencies:
                 data = await self._resolve_dependencies(resource_type, data)
+
+            target_inventory_id = data.get("inventory")
+            if target_inventory_id is not None:
+                try:
+                    kind = await self._get_target_inventory_kind(int(target_inventory_id))
+                except Exception as e:
+                    logger.warning(
+                        "inventory_kind_lookup_failed",
+                        target_inventory_id=target_inventory_id,
+                        source_id=source_id,
+                        error=str(e),
+                    )
+                    kind = None
+
+                if _inventory_kind_blocks_groups_and_hosts(kind):
+                    reason = (
+                        "Groups cannot be created for Smart or Constructed inventories "
+                        f"(target_inventory_id={target_inventory_id}, kind={kind!r})"
+                    )
+                    self.state.mark_skipped(resource_type, source_id, reason)
+                    self.stats["skipped_count"] += 1
+                    logger.info(
+                        "group_skipped_non_managed_inventory",
+                        resource_type=resource_type,
+                        source_id=source_id,
+                        group_name=data.get("name"),
+                        target_inventory_id=target_inventory_id,
+                        kind=kind,
+                    )
+                    return {"_skipped": True, "policy_skip": True, "name": data.get("name")}
+
+                try:
+                    has_sources = await _fetch_target_inventory_has_inventory_sources(
+                        self.client,
+                        int(target_inventory_id),
+                        cache=self._inventory_has_sources_cache,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "inventory_sources_check_failed",
+                        target_inventory_id=target_inventory_id,
+                        source_id=source_id,
+                        error=str(e),
+                    )
+                    has_sources = False
+
+                if has_sources:
+                    reason = (
+                        "Groups are defined by inventory source sync (SCM, Satellite, etc.); "
+                        f"run an inventory update on the target instead "
+                        f"(target_inventory_id={target_inventory_id})"
+                    )
+                    self.state.mark_skipped(resource_type, source_id, reason)
+                    self.stats["skipped_count"] += 1
+                    logger.info(
+                        "group_skipped_inventory_source_sync",
+                        resource_type=resource_type,
+                        source_id=source_id,
+                        group_name=data.get("name"),
+                        target_inventory_id=target_inventory_id,
+                    )
+                    return {"_skipped": True, "policy_skip": True, "name": data.get("name")}
 
             # Use correct API endpoint
             result = await self.client.create_resource(
@@ -1585,8 +1913,158 @@ class WorkflowNodeImporter(ResourceImporter):
 
     DEPENDENCIES = {
         "workflow_job_template": "workflow_job_templates",
-        "unified_job_template": "unified_job_templates",
+        "inventory": "inventory",
     }
+
+    _UJT_TYPE_BY_UNIFIED_JOB_TYPE = {
+        "job": "job_templates",
+        "workflow_job_template": "workflow_job_templates",
+        "project_update": "projects",
+        "inventory_update": "inventory_sources",
+    }
+
+    @staticmethod
+    def _resource_type_from_related_url(url: str | None) -> str | None:
+        """Infer canonical resource type from ``related.unified_job_template`` URL."""
+        if not url or not isinstance(url, str):
+            return None
+        parts = [p for p in url.split("/") if p]
+        if len(parts) < 2:
+            return None
+        if parts[-1].isdigit():
+            return normalize_resource_type(parts[-2])
+        if len(parts) >= 3 and parts[-2].isdigit():
+            return normalize_resource_type(parts[-3])
+        return None
+
+    def _infer_unified_job_template_resource_type(self, node: dict[str, Any]) -> str | None:
+        """Infer source UJT concrete type from related URL or summary fields."""
+        related = node.get("related") or {}
+        inferred = self._resource_type_from_related_url(related.get("unified_job_template"))
+        if inferred:
+            return inferred
+
+        summary = node.get("summary_fields") or {}
+        ujt = summary.get("unified_job_template") or {}
+        ujt_type = ujt.get("unified_job_type")
+        if isinstance(ujt_type, str):
+            return self._UJT_TYPE_BY_UNIFIED_JOB_TYPE.get(ujt_type)
+        return None
+
+    async def _resolve_unified_job_template_target_id(self, node: dict[str, Any]) -> int | None:
+        """Resolve node ``unified_job_template`` source ID to target ID for known types."""
+        source_id = node.get("unified_job_template")
+        if source_id is None:
+            return None
+        try:
+            source_id = int(source_id)
+        except (TypeError, ValueError):
+            return None
+
+        resource_type = self._infer_unified_job_template_resource_type(node)
+        if resource_type is None:
+            return None
+
+        if resource_type == "workflow_approval_templates":
+            # Some targets do not expose /workflow_approval_templates/ directly.
+            # Approval templates are created via
+            # POST workflow_job_template_nodes/<id>/create_approval_template/
+            # after the node exists.
+            return None
+
+        return self.state.get_mapped_id(resource_type, source_id)
+
+    async def _create_node_scoped_approval_template(
+        self,
+        target_node_id: int,
+        source_approval_id: int | None,
+        approval_data: dict[str, Any] | None,
+    ) -> None:
+        """Create approval template from a node-scoped endpoint and map IDs."""
+        data = approval_data or {}
+        name = data.get("name") or (
+            f"Workflow Approval {source_approval_id}" if source_approval_id else "Workflow Approval"
+        )
+        description = data.get("description") or ""
+        timeout = data.get("timeout")
+        try:
+            timeout = int(timeout) if timeout is not None else 0
+        except (TypeError, ValueError):
+            timeout = 0
+
+        endpoint = f"workflow_job_template_nodes/{target_node_id}/create_approval_template/"
+        try:
+            resp = await self.client.post(
+                endpoint,
+                json_data={"name": name, "description": description, "timeout": timeout},
+            )
+        except Exception as e:
+            logger.warning(
+                "workflow_approval_template_create_from_node_failed",
+                target_node_id=target_node_id,
+                source_approval_id=source_approval_id,
+                name=name,
+                error=str(e),
+            )
+            return
+
+        if source_approval_id is None:
+            return
+
+        rid = resp.get("id") if isinstance(resp, dict) else None
+        try:
+            target_id = int(rid) if rid is not None else None
+        except (TypeError, ValueError):
+            target_id = None
+        if target_id is None:
+            return
+
+        self.state.create_or_update_mapping(
+            resource_type="workflow_approval_templates",
+            source_id=source_approval_id,
+            target_id=target_id,
+            source_name=name,
+        )
+
+    async def _associate_node_edges(
+        self,
+        source_parent_node_id: int,
+        edge_field: str,
+        source_child_node_ids: list[int],
+    ) -> None:
+        """Create workflow node graph edges on target after all nodes exist."""
+        target_parent_id = self.state.get_mapped_id("workflow_nodes", source_parent_node_id)
+        if not target_parent_id:
+            logger.warning(
+                "workflow_node_edge_parent_unmapped",
+                source_parent_node_id=source_parent_node_id,
+                edge_field=edge_field,
+            )
+            return
+
+        endpoint = f"workflow_job_template_nodes/{int(target_parent_id)}/{edge_field}/"
+        for source_child_id in source_child_node_ids:
+            target_child_id = self.state.get_mapped_id("workflow_nodes", source_child_id)
+            if not target_child_id:
+                logger.warning(
+                    "workflow_node_edge_child_unmapped",
+                    source_parent_node_id=source_parent_node_id,
+                    source_child_node_id=source_child_id,
+                    edge_field=edge_field,
+                )
+                continue
+            try:
+                await self.client.post(endpoint, json_data={"id": int(target_child_id)})
+            except Exception as e:
+                logger.warning(
+                    "workflow_node_edge_associate_failed",
+                    source_parent_node_id=source_parent_node_id,
+                    target_parent_node_id=int(target_parent_id),
+                    source_child_node_id=source_child_id,
+                    target_child_node_id=int(target_child_id),
+                    edge_field=edge_field,
+                    error=str(e),
+                )
 
     async def import_workflow_nodes(
         self,
@@ -1609,14 +2087,46 @@ class WorkflowNodeImporter(ResourceImporter):
         results = []
         success_count = 0
         failed_count = 0
+        pending_edges: list[tuple[int, dict[str, list[int]]]] = []
 
         for node in nodes:
             source_id = node.pop("_source_id", node.get("id"))
+            try:
+                source_node_id = int(source_id) if source_id is not None else None
+            except (TypeError, ValueError):
+                source_node_id = None
 
-            # Remove edge fields before import (will be handled separately)
-            node.pop("success_nodes", None)
-            node.pop("failure_nodes", None)
-            node.pop("always_nodes", None)
+            source_approval_id: int | None = None
+            approval_data: dict[str, Any] | None = None
+            node_ujt_type = self._infer_unified_job_template_resource_type(node)
+            if node_ujt_type == "workflow_approval_templates":
+                raw_sid = node.get("unified_job_template")
+                try:
+                    source_approval_id = int(raw_sid) if raw_sid is not None else None
+                except (TypeError, ValueError):
+                    source_approval_id = None
+                raw_approval = node.get("_approval_template")
+                if isinstance(raw_approval, dict):
+                    approval_data = dict(raw_approval)
+                node.pop("unified_job_template", None)
+            else:
+                target_ujt = await self._resolve_unified_job_template_target_id(node)
+                if target_ujt is not None:
+                    node["unified_job_template"] = target_ujt
+                else:
+                    node.pop("unified_job_template", None)
+
+            edge_map: dict[str, list[int]] = {}
+            for edge_field in ("success_nodes", "failure_nodes", "always_nodes"):
+                raw_children = node.pop(edge_field, None) or []
+                child_ids: list[int] = []
+                for child in raw_children:
+                    try:
+                        child_ids.append(int(child))
+                    except (TypeError, ValueError):
+                        continue
+                if child_ids:
+                    edge_map[edge_field] = child_ids
 
             try:
                 result = await self.import_resource(
@@ -1627,6 +2137,20 @@ class WorkflowNodeImporter(ResourceImporter):
                 if result:
                     results.append(result)
                     success_count += 1
+                    if node_ujt_type == "workflow_approval_templates":
+                        tid = result.get("id")
+                        try:
+                            target_node_id = int(tid) if tid is not None else None
+                        except (TypeError, ValueError):
+                            target_node_id = None
+                        if target_node_id is not None:
+                            await self._create_node_scoped_approval_template(
+                                target_node_id,
+                                source_approval_id,
+                                approval_data,
+                            )
+                    if source_node_id is not None and edge_map:
+                        pending_edges.append((source_node_id, edge_map))
                 else:
                     failed_count += 1
             except Exception as e:
@@ -1651,8 +2175,7 @@ class WorkflowNodeImporter(ResourceImporter):
                         "error_type": type(e).__name__,
                     }
                 )
-
-                raise
+                continue
             finally:
                 # Update progress after each node
                 if progress_callback:
@@ -1661,6 +2184,10 @@ class WorkflowNodeImporter(ResourceImporter):
                         self.stats["error_count"],
                         self.stats["skipped_count"],
                     )
+
+        for source_parent_id, edge_map in pending_edges:
+            for edge_field, source_children in edge_map.items():
+                await self._associate_node_edges(source_parent_id, edge_field, source_children)
 
         return results
 
@@ -1679,6 +2206,26 @@ class ExecutionEnvironmentImporter(ResourceImporter):
         "credential": "credentials",
     }
 
+    def __init__(
+        self,
+        client: AAPTargetClient,
+        state: MigrationState,
+        performance_config: PerformanceConfig,
+        resource_mappings: dict[str, dict[str, str]] | None = None,
+        *,
+        skip_execution_environment_names: frozenset[str] | None = None,
+    ):
+        super().__init__(client, state, performance_config, resource_mappings)
+        self._skip_ee_names = skip_execution_environment_names or frozenset()
+
+    def _skip_ee(self, data: dict[str, Any]) -> bool:
+        if not self._skip_ee_names:
+            return False
+        name = data.get("name")
+        if not name or not isinstance(name, str):
+            return False
+        return name.strip().casefold() in self._skip_ee_names
+
     async def import_execution_environments(
         self,
         ees: list[dict[str, Any]],
@@ -1696,7 +2243,16 @@ class ExecutionEnvironmentImporter(ResourceImporter):
         Returns:
             List of created execution environment data
         """
-        return await self._import_parallel("execution_environments", ees, progress_callback)
+        to_import = [r for r in ees if not self._skip_ee(r)]
+        skipped = len(ees) - len(to_import)
+        if skipped:
+            self.stats["skipped_count"] += skipped
+            logger.info(
+                "execution_environments_skipped_by_config",
+                count=skipped,
+                message="Skipped by export.skip_execution_environment_names",
+            )
+        return await self._import_parallel("execution_environments", to_import, progress_callback)
 
 
 class RBACImporter(ResourceImporter):
@@ -1853,6 +2409,7 @@ class HostImporter(ResourceImporter):
         """
         super().__init__(client, state, performance_config, resource_mappings)
         self.bulk_ops = BulkOperations(client, performance_config)
+        self._inventory_has_sources_cache: dict[int, bool] = {}
 
     async def import_hosts_bulk(
         self,
@@ -1879,6 +2436,66 @@ class HostImporter(ResourceImporter):
             host_count=len(hosts),
             batch_size=batch_size,
         )
+
+        try:
+            inv_kind = await _fetch_target_inventory_kind(self.client, inventory_id)
+        except Exception as e:
+            logger.warning(
+                "inventory_kind_lookup_failed",
+                inventory_id=inventory_id,
+                error=str(e),
+            )
+            inv_kind = None
+
+        if _inventory_kind_blocks_groups_and_hosts(inv_kind):
+            self.stats["skipped_count"] += len(hosts)
+            logger.info(
+                "hosts_skipped_non_managed_inventory",
+                inventory_id=inventory_id,
+                host_count=len(hosts),
+                kind=inv_kind,
+                message="Hosts cannot be created for Smart or Constructed inventories",
+            )
+            return {
+                "total_requested": len(hosts),
+                "total_created": 0,
+                "total_failed": 0,
+                "total_skipped": len(hosts),
+                "results": [],
+            }
+
+        try:
+            has_sources = await _fetch_target_inventory_has_inventory_sources(
+                self.client,
+                inventory_id,
+                cache=self._inventory_has_sources_cache,
+            )
+        except Exception as e:
+            logger.warning(
+                "inventory_sources_check_failed",
+                inventory_id=inventory_id,
+                error=str(e),
+            )
+            has_sources = False
+
+        if has_sources:
+            self.stats["skipped_count"] += len(hosts)
+            logger.info(
+                "hosts_skipped_inventory_source_sync",
+                inventory_id=inventory_id,
+                host_count=len(hosts),
+                message=(
+                    "Hosts are populated by inventory source sync (SCM, Satellite, etc.); "
+                    "run an inventory update on the target instead of bulk import"
+                ),
+            )
+            return {
+                "total_requested": len(hosts),
+                "total_created": 0,
+                "total_failed": 0,
+                "total_skipped": len(hosts),
+                "results": [],
+            }
 
         all_results = []
         total_created = 0
@@ -2552,6 +3169,7 @@ class JobTemplateImporter(ResourceImporter):
         resource_type: str,
         source_id: int | str,
         data: dict[str, Any],
+        resolve_dependencies: bool = True,
     ) -> dict[str, Any] | None:
         """Import a job template with credential association.
 
@@ -2566,22 +3184,33 @@ class JobTemplateImporter(ResourceImporter):
         Returns:
             Created/updated resource data, or None if failed
         """
+        survey_spec = data.pop("_survey_spec", None)
         # Extract credentials before import (they're not valid API fields)
         credentials = data.pop("credentials", [])
         template_name = data.get("name")
 
         # Call base import_resource
-        result = await super().import_resource(resource_type, source_id, data)
+        result = await super().import_resource(
+            resource_type, source_id, data, resolve_dependencies=resolve_dependencies
+        )
 
         # Associate credentials if import succeeded and we have credentials
-        if result and result.get("id") and credentials:
-            logger.info(
-                "associating_credentials_with_job_template",
-                job_template_id=result["id"],
-                template_name=template_name,
-                credential_count=len(credentials),
-            )
-            await self._associate_credentials(result["id"], credentials, template_name)
+        if result and result.get("id"):
+            if credentials:
+                logger.info(
+                    "associating_credentials_with_job_template",
+                    job_template_id=result["id"],
+                    template_name=template_name,
+                    credential_count=len(credentials),
+                )
+                await self._associate_credentials(result["id"], credentials, template_name)
+            if survey_spec is not None:
+                await self._post_survey_spec_after_create(
+                    "job_templates",
+                    result["id"],
+                    survey_spec,
+                    template_name=template_name,
+                )
 
         return result
 
@@ -2723,6 +3352,27 @@ class WorkflowImporter(ResourceImporter):
         "inventory": "inventory",
     }
 
+    async def import_resource(
+        self,
+        resource_type: str,
+        source_id: int,
+        data: dict[str, Any],
+        resolve_dependencies: bool = True,
+    ) -> dict[str, Any] | None:
+        """Import a workflow; apply ``_survey_spec`` via POST after create."""
+        survey_spec = data.pop("_survey_spec", None)
+        result = await super().import_resource(
+            resource_type, source_id, data, resolve_dependencies=resolve_dependencies
+        )
+        if result and result.get("id") and survey_spec is not None:
+            await self._post_survey_spec_after_create(
+                "workflow_job_templates",
+                result["id"],
+                survey_spec,
+                template_name=result.get("name") or data.get("name"),
+            )
+        return result
+
     async def import_workflows(
         self,
         workflows: list[dict[str, Any]],
@@ -2742,12 +3392,15 @@ class WorkflowImporter(ResourceImporter):
             List of created workflow data
         """
         results = []
+        pending_nodes: list[dict[str, Any]] = []
         success_count = 0
         failed_count = 0
         skipped_count = 0
 
-        for workflow in workflows:
-            source_id = workflow.pop("_source_id", workflow.get("id"))
+        for workflow_raw in workflows:
+            source_id = workflow_raw.get("_source_id") or workflow_raw.get("id")
+            workflow = dict(workflow_raw)
+            workflow.pop("_source_id", None)
 
             # Extract nodes for separate import
             nodes = workflow.pop("_workflow_job_template_nodes", None)
@@ -2760,8 +3413,9 @@ class WorkflowImporter(ResourceImporter):
 
             if result:
                 if nodes:
-                    # Store nodes for later import
-                    result["_pending_nodes"] = nodes
+                    for node in nodes:
+                        if isinstance(node, dict):
+                            pending_nodes.append(dict(node))
                 results.append(result)
                 success_count += 1
             else:
@@ -2770,6 +3424,25 @@ class WorkflowImporter(ResourceImporter):
             # Update progress after each workflow
             if progress_callback:
                 progress_callback(success_count, failed_count, skipped_count)
+
+        if pending_nodes:
+            node_importer = WorkflowNodeImporter(
+                self.client,
+                self.state,
+                self.performance_config,
+                self.resource_mappings,
+            )
+            node_results = await node_importer.import_workflow_nodes(pending_nodes)
+            self.unresolved_dependencies.extend(node_importer.unresolved_dependencies)
+            self.import_errors.extend(node_importer.import_errors)
+            logger.info(
+                "workflow_nodes_imported_after_workflows",
+                workflow_count=success_count,
+                node_count=len(pending_nodes),
+                imported_nodes=len(node_results),
+                failed_nodes=node_importer.stats["error_count"],
+                skipped_nodes=node_importer.stats["skipped_count"],
+            )
 
         return results
 
@@ -3065,14 +3738,171 @@ class CredentialInputSourceImporter(ResourceImporter):
 class ConstructedInventoryImporter(ResourceImporter):
     """Importer for constructed inventory resources.
 
-    Constructed inventories are imported similarly to regular inventories
-    but POST to the constructed_inventories/ endpoint.
-    Saves id_mappings as 'inventories' type for downstream resolution.
+    Creates via ``POST constructed_inventories/``. Input inventories (UI) are
+    associated with ``POST inventories/<constructed>/input_inventories/`` and body
+    ``{"id": <pk>}`` per controller API. Export attaches ``input_inventories`` via
+    sub-fetch because list/detail only expose ``related.input_inventories``.
     """
 
     DEPENDENCIES = {
         "organization": "organizations",
     }
+
+    async def _associate_constructed_input_inventories(
+        self,
+        constructed_target_id: int,
+        input_inventory_target_ids: list[int],
+    ) -> None:
+        for input_tid in input_inventory_target_ids:
+            try:
+                await self.client.post(
+                    f"inventories/{constructed_target_id}/input_inventories/",
+                    json_data={"id": input_tid},
+                )
+            except Exception as e:
+                logger.warning(
+                    "constructed_inventory_input_inventory_associate_failed",
+                    constructed_inventory_id=constructed_target_id,
+                    input_inventory_id=input_tid,
+                    error=str(e),
+                )
+
+    async def _get_input_inventory_ids_on_target(self, constructed_target_id: int) -> set[int]:
+        """Return input inventory PKs already linked on the target constructed inventory."""
+        existing: set[int] = set()
+        page = 1
+        while True:
+            resp = await self.client.get(
+                f"inventories/{constructed_target_id}/input_inventories/",
+                params={"page": page, "page_size": 200},
+            )
+            for row in resp.get("results") or []:
+                rid = row.get("id")
+                if rid is not None:
+                    try:
+                        existing.add(int(rid))
+                    except (TypeError, ValueError):
+                        pass
+            if not resp.get("next"):
+                break
+            page += 1
+        return existing
+
+    async def sync_input_inventories_for_constructed_resources(
+        self,
+        resources: list[dict[str, Any]],
+    ) -> None:
+        """Ensure ``input_inventories`` M2M for every constructed row after batch pre-check.
+
+        Pre-check marks existing constructed inventories as skipped so
+        :meth:`import_constructed_inventories` never runs; this method still POSTs
+        associations using the full transformed resource list.
+        """
+        constructed_rows = [r for r in resources if (r.get("kind") or "") == "constructed"]
+        logger.info(
+            "constructed_inventory_input_inventory_sync_phase",
+            constructed_row_count=len(constructed_rows),
+        )
+        for raw in constructed_rows:
+            source_id = raw.get("_source_id")
+            if source_id is None:
+                source_id = raw.get("id")
+            if source_id is None:
+                continue
+            try:
+                sid = int(source_id)
+            except (TypeError, ValueError):
+                continue
+
+            target_constructed_id = self.state.get_mapped_id("inventory", sid)
+            if target_constructed_id is None:
+                target_constructed_id = self.state.get_mapped_id("constructed_inventories", sid)
+            if target_constructed_id is None:
+                target_constructed_id = await self._find_existing_constructed_inventory_id(
+                    raw.get("name")
+                )
+            if target_constructed_id is None:
+                logger.warning(
+                    "constructed_inventory_sync_no_target_id",
+                    source_id=sid,
+                    name=raw.get("name"),
+                )
+                continue
+
+            source_input_ids = normalize_input_inventories_to_source_ids(
+                raw.get("input_inventories")
+            )
+            if not source_input_ids:
+                logger.info(
+                    "constructed_inventory_sync_no_source_inputs",
+                    source_id=sid,
+                    constructed_name=raw.get("name"),
+                    message="Transformed row has no input_inventories; re-export with a bridge "
+                    "version that sub-fetches GET inventories/<id>/input_inventories/",
+                )
+                continue
+
+            target_input_ids: list[int] = []
+            for inv_sid in source_input_ids:
+                inv_tid = self.state.get_mapped_id("inventory", inv_sid)
+                if inv_tid is not None:
+                    target_input_ids.append(inv_tid)
+                elif await self.client.resource_exists("inventory", int(inv_sid)):
+                    target_input_ids.append(int(inv_sid))
+
+            if not target_input_ids:
+                logger.warning(
+                    "constructed_inventory_sync_no_mapped_inputs",
+                    source_id=sid,
+                    constructed_name=raw.get("name"),
+                    source_input_inventory_ids=source_input_ids,
+                )
+                continue
+
+            cid = int(target_constructed_id)
+            already = await self._get_input_inventory_ids_on_target(cid)
+            missing = [tid for tid in target_input_ids if tid not in already]
+            if not missing:
+                logger.info(
+                    "constructed_inventory_input_inventories_already_satisfied",
+                    constructed_target_id=cid,
+                    source_id=sid,
+                    input_inventory_target_ids=target_input_ids,
+                )
+                continue
+
+            await self._associate_constructed_input_inventories(cid, missing)
+            logger.info(
+                "constructed_inventory_input_inventories_synced",
+                constructed_target_id=cid,
+                source_id=sid,
+                added_input_inventory_ids=missing,
+            )
+
+    async def _find_existing_constructed_inventory_id(self, name: str | None) -> int | None:
+        """Resolve existing constructed inventory ID by name after 409 conflict."""
+        if not name:
+            return None
+        try:
+            resp = await self.client.get(
+                "constructed_inventories/",
+                params={"name": name, "page_size": 1},
+            )
+        except Exception as e:
+            logger.warning(
+                "constructed_inventory_existing_lookup_failed",
+                name=name,
+                error=str(e),
+            )
+            return None
+        rows = resp.get("results") or []
+        if not rows:
+            return None
+        rid = rows[0].get("id")
+        try:
+            return int(rid) if rid is not None else None
+        except (TypeError, ValueError):
+            return None
 
     async def import_constructed_inventories(
         self,
@@ -3090,11 +3920,47 @@ class ConstructedInventoryImporter(ResourceImporter):
         """
         results = []
 
-        for inventory in inventories:
-            source_id = inventory.pop("_source_id", inventory.get("id"))
+        for inv_raw in inventories:
+            source_id = inv_raw.get("_source_id") or inv_raw.get("id")
+            # Copy before popping: ``transformed_resources`` in the CLI reuses these dicts for
+            # :meth:`sync_input_inventories_for_constructed_resources`, which runs after import.
+            inventory = dict(inv_raw)
+            inventory.pop("_source_id", None)
 
             # Remove 'kind' field before POST - API sets it automatically
             inventory.pop("kind", None)
+
+            raw_inputs = inventory.pop("input_inventories", None)
+            source_input_ids = normalize_input_inventories_to_source_ids(raw_inputs)
+            target_input_ids: list[int] = []
+            for inv_sid in source_input_ids:
+                inv_tid = self.state.get_mapped_id("inventory", inv_sid)
+                if inv_tid is not None:
+                    target_input_ids.append(inv_tid)
+                else:
+                    # Fallback when source/target PKs happen to be the same.
+                    if await self.client.resource_exists("inventory", int(inv_sid)):
+                        target_input_ids.append(int(inv_sid))
+                        logger.info(
+                            "constructed_inventory_input_inventory_resolved_same_id",
+                            constructed_inventory_source_id=source_id,
+                            constructed_name=inventory.get("name"),
+                            inventory_id=int(inv_sid),
+                        )
+                    else:
+                        logger.warning(
+                            "constructed_inventory_input_inventory_unmapped",
+                            constructed_inventory_source_id=source_id,
+                            constructed_name=inventory.get("name"),
+                            input_inventory_source_id=inv_sid,
+                        )
+            if source_input_ids and not target_input_ids:
+                logger.error(
+                    "constructed_inventory_all_input_inventories_unmapped",
+                    constructed_inventory_source_id=source_id,
+                    constructed_name=inventory.get("name"),
+                    source_input_inventory_ids=source_input_ids,
+                )
 
             # Resolve organization
             org_source_id = inventory.get("organization")
@@ -3125,6 +3991,10 @@ class ConstructedInventoryImporter(ResourceImporter):
                 target_id = result.get("id")
 
                 if target_id:
+                    if target_input_ids:
+                        await self._associate_constructed_input_inventories(
+                            target_id, target_input_ids
+                        )
                     # Save as 'inventory' type for downstream resolution
                     self.state.create_or_update_mapping(
                         resource_type="inventory",
@@ -3142,6 +4012,26 @@ class ConstructedInventoryImporter(ResourceImporter):
                     source_id=source_id,
                     name=inventory.get("name"),
                 )
+                if target_input_ids:
+                    existing_target_id = await self._find_existing_constructed_inventory_id(
+                        inventory.get("name")
+                    )
+                    if existing_target_id:
+                        await self._associate_constructed_input_inventories(
+                            existing_target_id, target_input_ids
+                        )
+                        self.state.create_or_update_mapping(
+                            resource_type="inventory",
+                            source_id=source_id,
+                            target_id=existing_target_id,
+                            source_name=inventory.get("name"),
+                        )
+                        logger.info(
+                            "constructed_inventory_inputs_associated_on_existing",
+                            source_id=source_id,
+                            target_id=existing_target_id,
+                            input_inventory_target_ids=target_input_ids,
+                        )
             except Exception as e:
                 self.stats["error_count"] += 1
                 logger.error(
@@ -3518,6 +4408,7 @@ def create_importer(
     state: MigrationState,
     performance_config: PerformanceConfig,
     resource_mappings: dict[str, dict[str, str]] | None = None,
+    skip_execution_environment_names: list[str] | None = None,
 ) -> ResourceImporter:
     """Create appropriate importer for resource type.
 
@@ -3527,6 +4418,7 @@ def create_importer(
         state: Migration state manager
         performance_config: Performance configuration
         resource_mappings: Optional resource name mappings from config/mappings.yaml
+        skip_execution_environment_names: EE names to skip (import); None means no name filter
 
     Returns:
         Appropriate ResourceImporter subclass instance
@@ -3580,6 +4472,20 @@ def create_importer(
         raise NotImplementedError(
             f"No importer implemented for resource type: {resource_type} (canonical: {canonical_type}). "
             f"Available importers: {', '.join(sorted(importers.keys()))}"
+        )
+
+    if canonical_type == "execution_environments":
+        skip_frozen = (
+            normalized_execution_environment_skip_names(skip_execution_environment_names)
+            if skip_execution_environment_names is not None
+            else frozenset()
+        )
+        return ExecutionEnvironmentImporter(
+            client,
+            state,
+            performance_config,
+            resource_mappings,
+            skip_execution_environment_names=skip_frozen,
         )
 
     return importer_class(client, state, performance_config, resource_mappings)

@@ -84,6 +84,12 @@ performance:
   project_sync_timeout: 600
   project_sync_poll_interval: 10
 
+  # After importing inventory_sources: POST inventory_sources/<id>/update/ then poll inventory_sources/<id> status
+  inventory_source_update_job_timeout_seconds: 3600
+  inventory_source_update_poll_interval_seconds: 3
+  inventory_source_sync_max_concurrent: 5
+  inventory_source_sync_fail_on_job_failure: false
+
   # Project Patch (Phase 2)
   project_patch_batch_size: 100
   project_patch_batch_interval: 180
@@ -204,10 +210,18 @@ advanced:
 # Export Configuration
 # ============================================================================
 export:
+  # Prefer true: hosts tied to inventory sources are re-created by sync on the target.
   skip_dynamic_hosts: false
   skip_smart_inventories: false
   skip_constructed_inventories: false
   skip_inventory_sources: []
+  # Omit these EE names from export/import (case-insensitive). Use [] to migrate all.
+  skip_execution_environment_names:
+    - Control Plane Execution Environment
+    - Default execution environment
+    - Hub Default execution environment
+    - Hub Minimal execution environment
+    - Minimal execution environment
   skip_pending_deletion_inventories: true
   skip_hosts_with_inventory_sources: false
   records_per_file: 1000

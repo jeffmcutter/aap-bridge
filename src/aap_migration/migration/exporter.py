@@ -12,11 +12,37 @@ from typing import Any, Protocol, runtime_checkable
 
 from aap_migration.client.aap_source_client import AAPSourceClient
 from aap_migration.client.exceptions import APIError
-from aap_migration.config import PerformanceConfig
+from aap_migration.config import PerformanceConfig, normalized_execution_environment_skip_names
 from aap_migration.migration.state import MigrationState
+from aap_migration.resources import get_endpoint
+from aap_migration.utils.inventory_fk import parse_inventory_id_from_api_value
 from aap_migration.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+async def _fetch_template_survey_spec(
+    client: AAPSourceClient,
+    resource_type: str,
+    template_id: int,
+) -> dict[str, Any]:
+    """GET ``{resource}/{id}/survey_spec/`` (empty ``{}`` when no survey questions).
+
+    Stored on export as ``_survey_spec`` and POSTed after template create on import.
+    """
+    base = get_endpoint(resource_type).rstrip("/")
+    endpoint = f"{base}/{template_id}/survey_spec/"
+    try:
+        resp = await client.get(endpoint)
+        return resp if isinstance(resp, dict) else {}
+    except Exception as e:
+        logger.warning(
+            "survey_spec_fetch_failed",
+            resource_type=resource_type,
+            template_id=template_id,
+            error=str(e),
+        )
+        return {}
 
 
 @runtime_checkable
@@ -784,6 +810,29 @@ class InventoryExporter(ResourceExporter):
         )
         self._cache_loaded = True
 
+    async def _fetch_constructed_input_inventory_ids(self, constructed_inventory_id: int) -> list[int]:
+        """GET ``inventories/<id>/input_inventories/`` and return input inventory PKs in order.
+
+        The inventory list/detail response does not include a top-level ``input_inventories``
+        array—only ``related.input_inventories``—so we sub-fetch for migration.
+        """
+        endpoint = f"inventories/{constructed_inventory_id}/input_inventories/"
+        try:
+            rows = await self.client.get_paginated(endpoint, page_size=200)
+        except Exception as e:
+            logger.warning(
+                "constructed_inventory_input_inventories_fetch_failed",
+                constructed_inventory_id=constructed_inventory_id,
+                error=str(e),
+            )
+            return []
+        out: list[int] = []
+        for row in rows:
+            rid = parse_inventory_id_from_api_value(row)
+            if rid is not None:
+                out.append(rid)
+        return out
+
     async def export(
         self,
         filters: dict[str, Any] | None = None,
@@ -796,7 +845,9 @@ class InventoryExporter(ResourceExporter):
             include_sources: Whether to fetch inventory sources for each inventory
 
         Yields:
-            Inventory dictionaries with optional 'sources' field
+            Inventory dictionaries with optional ``sources`` field and, for
+            ``kind=constructed``, ``input_inventories`` (source inventory PKs from
+            the input_inventories sub-list endpoint).
         """
         logger.info("exporting_inventories", include_sources=include_sources)
 
@@ -823,6 +874,68 @@ class InventoryExporter(ResourceExporter):
             if include_sources:
                 inventory_id = inventory["id"]
                 inventory["sources"] = self._inventory_sources_cache.get(inventory_id, [])
+
+            # Constructed inventories: input inventory IDs live under related.input_inventories only;
+            # fetch sub-resource so export JSON matches what import needs (top-level input_inventories).
+            if (inventory.get("kind") or "") == "constructed":
+                cid = inventory["id"]
+                input_ids = await self._fetch_constructed_input_inventory_ids(cid)
+                if input_ids:
+                    inventory["input_inventories"] = input_ids
+                    logger.info(
+                        "constructed_inventory_input_inventories_attached",
+                        constructed_inventory_id=cid,
+                        input_inventory_source_ids=input_ids,
+                    )
+                else:
+                    logger.warning(
+                        "constructed_inventory_input_inventories_empty_after_fetch",
+                        constructed_inventory_id=cid,
+                        message="Sub-list returned no input inventory PKs; UI input list will not migrate",
+                    )
+
+            yield inventory
+
+    async def export_parallel(
+        self,
+        resource_type: str,
+        endpoint: str,
+        page_size: int = 200,
+        max_concurrent_pages: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Parallel fetch with the same enrichment as :meth:`export` (sources cache + constructed inputs).
+
+        The CLI uses this for inventory export; the base implementation only yields raw list rows.
+        """
+        await self._load_inventory_sources_cache()
+
+        async for inventory in super().export_parallel(
+            resource_type=resource_type,
+            endpoint=endpoint,
+            page_size=page_size,
+            max_concurrent_pages=max_concurrent_pages,
+            filters=filters,
+        ):
+            inventory_id = inventory["id"]
+            inventory["sources"] = self._inventory_sources_cache.get(inventory_id, [])
+
+            if (inventory.get("kind") or "") == "constructed":
+                cid = int(inventory["id"])
+                input_ids = await self._fetch_constructed_input_inventory_ids(cid)
+                if input_ids:
+                    inventory["input_inventories"] = input_ids
+                    logger.info(
+                        "constructed_inventory_input_inventories_attached",
+                        constructed_inventory_id=cid,
+                        input_inventory_source_ids=input_ids,
+                    )
+                else:
+                    logger.warning(
+                        "constructed_inventory_input_inventories_empty_after_fetch",
+                        constructed_inventory_id=cid,
+                        message="Sub-list returned no input inventory PKs; UI input list will not migrate",
+                    )
 
             yield inventory
 
@@ -1275,7 +1388,7 @@ class JobTemplateExporter(ResourceExporter):
             include_credentials: Whether to fetch credentials for each template
 
         Yields:
-            Job template dictionaries with optional '_credentials' field
+            Job template dictionaries with optional ``_credentials`` and ``_survey_spec``
         """
         logger.info("exporting_job_templates", include_credentials=include_credentials)
         async for template in self.export_resources(
@@ -1315,6 +1428,10 @@ class JobTemplateExporter(ResourceExporter):
                             error=str(e),
                         )
                         template["_credentials"] = []
+
+            template["_survey_spec"] = await _fetch_template_survey_spec(
+                self.client, "job_templates", template["id"]
+            )
 
             yield template
 
@@ -1366,11 +1483,77 @@ class JobTemplateExporter(ResourceExporter):
                     )
                     template["_credentials"] = []
 
+            template["_survey_spec"] = await _fetch_template_survey_spec(
+                self.client, "job_templates", template["id"]
+            )
+
             yield template
 
 
 class WorkflowExporter(ResourceExporter):
     """Exporter for workflow job template resources."""
+
+    @staticmethod
+    def _endpoint_from_related_url(url: str | None) -> str | None:
+        """Convert related URL to client endpoint path (without API prefix)."""
+        if not url or not isinstance(url, str):
+            return None
+        marker = "/api/controller/v2/"
+        if marker in url:
+            return url.split(marker, 1)[1]
+        cleaned = url.lstrip("/")
+        if cleaned.startswith("api/controller/v2/"):
+            return cleaned[len("api/controller/v2/") :]
+        return cleaned
+
+    async def _attach_workflow_approval_template_data(
+        self, nodes: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Attach approval template payloads for approval nodes.
+
+        Workflow approval templates are separate resources and must be created
+        before node linking on import. We capture minimal fields needed for that.
+        """
+        for node in nodes:
+            summary = node.get("summary_fields") or {}
+            ujt = summary.get("unified_job_template") or {}
+            if (ujt.get("unified_job_type") or "") != "workflow_approval":
+                continue
+
+            approval_data: dict[str, Any] = {
+                "id": ujt.get("id") or node.get("unified_job_template"),
+                "name": ujt.get("name"),
+                "description": ujt.get("description", ""),
+                "timeout": ujt.get("timeout", 0),
+            }
+
+            endpoint = self._endpoint_from_related_url(
+                (node.get("related") or {}).get("unified_job_template")
+            )
+            if endpoint:
+                try:
+                    details = await self.client.get(endpoint)
+                    approval_data.update(
+                        {
+                            "id": details.get("id", approval_data.get("id")),
+                            "name": details.get("name", approval_data.get("name")),
+                            "description": details.get(
+                                "description", approval_data.get("description", "")
+                            ),
+                            "timeout": details.get("timeout", approval_data.get("timeout", 0)),
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "workflow_approval_template_detail_fetch_failed",
+                        endpoint=endpoint,
+                        node_id=node.get("id"),
+                        error=str(e),
+                    )
+
+            node["_approval_template"] = approval_data
+
+        return nodes
 
     async def export(
         self,
@@ -1398,6 +1581,7 @@ class WorkflowExporter(ResourceExporter):
             if include_nodes:
                 try:
                     nodes = await self.client.get_workflow_nodes(workflow["id"])
+                    nodes = await self._attach_workflow_approval_template_data(nodes)
                     workflow["nodes"] = nodes
                     logger.debug(
                         "workflow_nodes_fetched",
@@ -1411,6 +1595,53 @@ class WorkflowExporter(ResourceExporter):
                         error=str(e),
                     )
                     workflow["nodes"] = []
+
+            workflow["_survey_spec"] = await _fetch_template_survey_spec(
+                self.client, "workflow_job_templates", workflow["id"]
+            )
+
+            yield workflow
+
+    async def export_parallel(
+        self,
+        resource_type: str,
+        endpoint: str,
+        page_size: int = 200,
+        max_concurrent_pages: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Export workflows with nodes when using parallel page fetches.
+
+        The CLI export path uses ``export_parallel`` for all resource types; without
+        this override, workflow nodes are never attached to workflow templates.
+        """
+        async for workflow in super().export_parallel(
+            resource_type=resource_type,
+            endpoint=endpoint,
+            page_size=page_size,
+            max_concurrent_pages=max_concurrent_pages,
+            filters=filters,
+        ):
+            try:
+                nodes = await self.client.get_workflow_nodes(workflow["id"])
+                nodes = await self._attach_workflow_approval_template_data(nodes)
+                workflow["nodes"] = nodes
+                logger.debug(
+                    "workflow_nodes_fetched",
+                    workflow_id=workflow["id"],
+                    node_count=len(nodes),
+                )
+            except Exception as e:
+                logger.warning(
+                    "failed_to_fetch_workflow_nodes",
+                    workflow_id=workflow["id"],
+                    error=str(e),
+                )
+                workflow["nodes"] = []
+
+            workflow["_survey_spec"] = await _fetch_template_survey_spec(
+                self.client, "workflow_job_templates", workflow["id"]
+            )
 
             yield workflow
 
@@ -1717,6 +1948,43 @@ class ExecutionEnvironmentExporter(ResourceExporter):
     runtime environment in AAP 2.x.
     """
 
+    def __init__(
+        self,
+        client: AAPSourceClient,
+        state: MigrationState,
+        performance_config: PerformanceConfig,
+        skip_execution_environment_names: list[str] | None = None,
+    ):
+        super().__init__(client, state, performance_config)
+        self._skip_ee_names = normalized_execution_environment_skip_names(
+            skip_execution_environment_names
+        )
+
+    def _skip_ee(self, data: dict[str, Any]) -> bool:
+        if not self._skip_ee_names:
+            return False
+        name = data.get("name")
+        if not name or not isinstance(name, str):
+            return False
+        return name.strip().casefold() in self._skip_ee_names
+
+    async def _process_resource(
+        self, resource: dict[str, Any], resource_type: str
+    ) -> dict[str, Any] | None:
+        """Skip configured EE names for sequential export, export_parallel, and export_resources."""
+        processed = await super()._process_resource(resource, resource_type)
+        if processed is None:
+            return None
+        if resource_type == "execution_environments" and self._skip_ee(processed):
+            self.stats["skipped_count"] += 1
+            logger.info(
+                "execution_environment_skipped_by_config",
+                name=processed.get("name"),
+                source_id=processed.get("id"),
+            )
+            return None
+        return processed
+
     async def export(
         self, filters: dict[str, Any] | None = None
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1910,6 +2178,7 @@ def create_exporter(
     client: AAPSourceClient,
     state: MigrationState,
     performance_config: PerformanceConfig,
+    skip_execution_environment_names: list[str] | None = None,
 ) -> ExporterProtocol:
     """Create appropriate exporter for resource type.
 
@@ -1918,6 +2187,7 @@ def create_exporter(
         client: AAP source client instance
         state: Migration state manager
         performance_config: Performance configuration
+        skip_execution_environment_names: Optional EE names to skip (export); defaults to no filter
 
     Returns:
         Exporter instance implementing ExporterProtocol
@@ -1962,6 +2232,14 @@ def create_exporter(
         raise NotImplementedError(
             f"No exporter implemented for resource type: {resource_type} (canonical: {canonical_type}). "
             f"Available exporters: {', '.join(sorted(exporters.keys()))}"
+        )
+
+    if canonical_type == "execution_environments":
+        return ExecutionEnvironmentExporter(
+            client,
+            state,
+            performance_config,
+            skip_execution_environment_names=skip_execution_environment_names,
         )
 
     return exporter_class(client, state, performance_config)

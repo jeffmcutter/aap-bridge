@@ -14,12 +14,14 @@ from aap_migration.config import PerformanceConfig
 from aap_migration.migration.importer import (
     CredentialImporter,
     HostImporter,
+    InventoryGroupImporter,
     InventoryImporter,
     JobTemplateImporter,
     OrganizationImporter,
     ProjectImporter,
     ResourceImporter,
     WorkflowImporter,
+    _fetch_target_inventory_has_inventory_sources,
     create_importer,
 )
 from aap_migration.migration.state import MigrationState
@@ -36,6 +38,8 @@ def mock_client():
     client.get_all_resources_parallel = AsyncMock()
     client.bulk_create_resources = AsyncMock(return_value=[{"id": 100, "name": "Test Resource"}])
     client.get_workflow_nodes = AsyncMock(return_value=[])
+    client.get_resource = AsyncMock(return_value={"kind": "", "id": 1, "name": "Test Inventory"})
+    client.get = AsyncMock(return_value={"count": 0, "results": []})
     return client
 
 
@@ -62,6 +66,33 @@ def performance_config():
             "job_templates": 100,
         }
     )
+
+
+class TestFetchTargetInventoryHasInventorySources:
+    """Tests for inventory-scoped inventory_sources detection (hosts/groups skip policy)."""
+
+    @pytest.mark.asyncio
+    async def test_prefers_nested_inventory_sources_list(self):
+        client = MagicMock(spec=AAPTargetClient)
+        client.get = AsyncMock(return_value={"count": 0, "results": []})
+        result = await _fetch_target_inventory_has_inventory_sources(client, 42)
+        assert result is False
+        client.get.assert_awaited_once()
+        path = client.get.call_args[0][0]
+        assert "inventories/42/inventory_sources/" in path
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_flat_list_when_nested_fails(self):
+        client = MagicMock(spec=AAPTargetClient)
+        client.get = AsyncMock(
+            side_effect=[
+                ConnectionError("nested unavailable"),
+                {"count": 0, "results": []},
+            ]
+        )
+        result = await _fetch_target_inventory_has_inventory_sources(client, 3)
+        assert result is False
+        assert client.get.await_count == 2
 
 
 @pytest.fixture
@@ -361,6 +392,74 @@ class TestHostImporter:
         # No hosts should be created
         assert host_importer.stats["skipped_count"] == 1
 
+    @pytest.mark.asyncio
+    async def test_import_hosts_bulk_skips_smart_inventory(self, host_importer, mock_client):
+        """Hosts cannot be created on smart/constructed inventories."""
+        mock_client.get_resource = AsyncMock(return_value={"kind": "smart", "id": 10})
+        host_importer.bulk_ops.bulk_create_hosts = AsyncMock()
+
+        hosts = [{"_source_id": 1, "name": "host-1", "enabled": True}]
+        result = await host_importer.import_hosts_bulk(inventory_id=10, hosts=hosts)
+
+        assert result["total_created"] == 0
+        assert result["total_skipped"] == 1
+        host_importer.bulk_ops.bulk_create_hosts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_import_hosts_bulk_skips_when_inventory_has_sources(self, host_importer, mock_client):
+        """Hosts from sync-managed inventories should come from inventory update, not bulk import."""
+        mock_client.get_resource = AsyncMock(return_value={"kind": "", "id": 10})
+        mock_client.get = AsyncMock(return_value={"count": 1, "results": [{"id": 1}]})
+        host_importer.bulk_ops.bulk_create_hosts = AsyncMock()
+
+        hosts = [{"_source_id": 1, "name": "host-1", "enabled": True}]
+        result = await host_importer.import_hosts_bulk(inventory_id=10, hosts=hosts)
+
+        assert result["total_created"] == 0
+        assert result["total_skipped"] == 1
+        host_importer.bulk_ops.bulk_create_hosts.assert_not_called()
+
+
+class TestInventoryGroupImporter:
+    """Tests for InventoryGroupImporter."""
+
+    @pytest.fixture
+    def group_importer(self, mock_client, mock_state, performance_config):
+        return InventoryGroupImporter(mock_client, mock_state, performance_config)
+
+    @pytest.mark.asyncio
+    async def test_import_group_skips_smart_inventory(self, group_importer, mock_client, mock_state):
+        mock_state.is_migrated.return_value = False
+        mock_state.get_mapped_id.return_value = 99
+        mock_client.get_resource = AsyncMock(return_value={"kind": "smart", "id": 99})
+
+        result = await group_importer.import_resource(
+            resource_type="groups",
+            source_id=19,
+            data={"name": "g1", "inventory": 5},
+        )
+
+        assert result == {"_skipped": True, "policy_skip": True, "name": "g1"}
+        mock_client.create_resource.assert_not_called()
+        mock_state.mark_skipped.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_import_group_skips_sourced_inventory(self, group_importer, mock_client, mock_state):
+        mock_state.is_migrated.return_value = False
+        mock_state.get_mapped_id.return_value = 99
+        mock_client.get_resource = AsyncMock(return_value={"kind": "", "id": 99})
+        mock_client.get = AsyncMock(return_value={"count": 1, "results": [{"id": 1}]})
+
+        result = await group_importer.import_resource(
+            resource_type="groups",
+            source_id=20,
+            data={"name": "g2", "inventory": 5},
+        )
+
+        assert result == {"_skipped": True, "policy_skip": True, "name": "g2"}
+        mock_client.create_resource.assert_not_called()
+        mock_state.mark_skipped.assert_called_once()
+
 
 class TestCredentialImporter:
     """Tests for CredentialImporter."""
@@ -508,6 +607,30 @@ class TestJobTemplateImporter:
         assert "_needs_execution_environment" not in call_args
         assert "_custom_virtualenv_path" not in call_args
 
+    @pytest.mark.asyncio
+    async def test_import_job_template_posts_survey_spec(self, job_template_importer, mock_client):
+        """Survey body is POSTed to the survey_spec sub-resource after create."""
+        mock_client.create_resource.return_value = {"id": 500, "name": "Survey JT"}
+        mock_client.post = AsyncMock(return_value={})
+
+        templates = [
+            {
+                "_source_id": 1,
+                "name": "Survey JT",
+                "inventory": 1,
+                "project": 1,
+                "playbook": "site.yml",
+                "_survey_spec": {"name": "", "description": "", "spec": []},
+            }
+        ]
+
+        await job_template_importer.import_job_templates(templates)
+
+        mock_client.post.assert_called_once()
+        call_kw = mock_client.post.call_args[1]
+        assert call_kw["json_data"] == {"name": "", "description": "", "spec": []}
+        assert "job_templates/500/survey_spec/" in mock_client.post.call_args[0][0]
+
 
 class TestWorkflowImporter:
     """Tests for WorkflowImporter."""
@@ -548,13 +671,38 @@ class TestWorkflowImporter:
         results = await workflow_importer.import_workflows(workflows)
 
         assert len(results) == 1
-        # Nodes should be stored for later import
-        assert "_pending_nodes" in results[0]
-        assert len(results[0]["_pending_nodes"]) == 2
+        # Nodes are imported immediately after workflows are created.
+        assert "_pending_nodes" not in results[0]
+        assert mock_client.create_resource.call_count == 3
 
         # Nodes should not be in the create call
-        call_args = mock_client.create_resource.call_args[1]["data"]
+        call_args = mock_client.create_resource.call_args_list[0][1]["data"]
         assert "_workflow_job_template_nodes" not in call_args
+
+    @pytest.mark.asyncio
+    async def test_import_workflow_posts_survey_spec(self, workflow_importer, mock_client):
+        """Workflow survey body is POSTed after workflow create."""
+        mock_client.create_resource.return_value = {"id": 600, "name": "WF Survey"}
+        mock_client.post = AsyncMock(return_value={})
+
+        workflows = [
+            {
+                "_source_id": 1,
+                "name": "WF Survey",
+                "organization": 1,
+                "_survey_spec": {"name": "", "description": "", "spec": []},
+            }
+        ]
+
+        await workflow_importer.import_workflows(workflows)
+
+        mock_client.post.assert_called_once()
+        assert mock_client.post.call_args[1]["json_data"] == {
+            "name": "",
+            "description": "",
+            "spec": [],
+        }
+        assert "workflow_job_templates/600/survey_spec/" in mock_client.post.call_args[0][0]
 
 
 class TestCreateImporter:
