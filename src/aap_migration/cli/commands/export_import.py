@@ -1775,9 +1775,9 @@ def import_cmd(
                                         existing_users
                                     )
 
-                            # Teams: users may have been processed earlier in phase1, before team
-                            # id_mappings existed. Reconcile user->team memberships now that teams
-                            # are imported/mapped.
+                            # Teams: users are imported in the same phase immediately before teams,
+                            # but team id_mappings aren't set until now. Reconcile any memberships
+                            # that were skipped during user import due to unmapped team IDs.
                             if (
                                 rtype == "teams"
                                 and not dry_run
@@ -1829,8 +1829,8 @@ def import_cmd(
                                     )
 
                             # NOTE: SCM sync waiting has been removed from automatic flow.
-                            # With two-phase import, users run phase1 (up to projects),
-                            # then manually wait for project sync, then run phase2.
+                            # With two-phase import, run phase1 (foundation + projects),
+                            # wait for project SCM sync, then run phase2 (inventory + automation).
                             # The wait_for_project_sync() function is still available
                             # for manual use if needed.
 
@@ -1993,6 +1993,35 @@ def import_cmd(
                         except Exception as e:
                             echo_warning(f"Project patching failed: {e}")
                             logger.error("patch_projects_failed", error=str(e))
+
+                # Team-as-principal RBAC (roles on orgs/projects/JTs/...) is exported in
+                # _team_role_grants on each team. Apply after JTs and related resources
+                # exist (skip phase1-only: grants to phase2 types would 404 on mapping).
+                if (
+                    not dry_run
+                    and phase in ("all", "phase2")
+                    and (input_dir / "teams").is_dir()
+                ):
+                    try:
+                        team_importer = create_importer(
+                            "teams",
+                            ctx.target_client,
+                            ctx.migration_state,
+                            ctx.config.performance,
+                            ctx.config.resource_mappings,
+                            skip_execution_environment_names=ctx.config.export.skip_execution_environment_names,
+                        )
+                        n = await team_importer.sync_team_resource_role_grants_from_xformed(
+                            input_dir
+                        )
+                        if n:
+                            echo_info(
+                                f"Applied {format_count(n)} team resource role grant(s) "
+                                "(org/project/JT/WF/… roles held by teams)"
+                            )
+                    except Exception as e:
+                        echo_warning(f"Team resource role grants sync failed: {e}")
+                        logger.warning("team_resource_role_grants_sync_failed", error=str(e))
 
             click.echo()
             if dry_run:

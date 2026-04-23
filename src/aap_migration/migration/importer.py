@@ -5,7 +5,9 @@ that handle dependency resolution, bulk operations, and conflict handling.
 """
 
 import asyncio
+import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from aap_migration.client.aap_target_client import AAPTargetClient
@@ -1359,6 +1361,134 @@ class TeamImporter(ResourceImporter):
             List of created team data
         """
         return await self._import_parallel("teams", teams, progress_callback)
+
+    async def _list_object_role_rows(
+        self, content_resource_type: str, target_resource_id: int
+    ) -> list[dict[str, Any]]:
+        """Fetch all pages of ``<resource>/<id>/object_roles/`` on the target controller."""
+        ctype = normalize_resource_type(content_resource_type)
+        try:
+            base = get_endpoint(ctype).rstrip("/")
+        except KeyError:
+            logger.warning(
+                "team_role_grants_unknown_content_type",
+                content_resource_type=content_resource_type,
+            )
+            return []
+        out: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            resp = await self.client.get(
+                f"{base}/{target_resource_id}/object_roles/",
+                params={"page": page, "page_size": 200},
+            )
+            batch = resp.get("results", [])
+            out.extend(batch)
+            if not resp.get("next") or not batch:
+                break
+            page += 1
+        return out
+
+    async def _resolve_target_role_id(
+        self,
+        content_resource_type: str,
+        target_resource_id: int,
+        role_display_name: str,
+    ) -> int | None:
+        want = (role_display_name or "").strip().casefold()
+        if not want:
+            return None
+        rows = await self._list_object_role_rows(content_resource_type, target_resource_id)
+        for row in rows:
+            if str(row.get("name", "")).strip().casefold() == want:
+                rid = row.get("id")
+                if rid is not None:
+                    return int(rid)
+        logger.warning(
+            "team_role_grant_target_role_not_found",
+            content_resource_type=content_resource_type,
+            target_resource_id=target_resource_id,
+            role_name=role_display_name,
+        )
+        return None
+
+    async def sync_team_resource_role_grants_from_xformed(self, input_dir: Path) -> int:
+        """Apply team-as-principal role grants from transformed team JSON (after other resources exist).
+
+        Reads ``_team_role_grants`` from xformed team files and POSTs each to
+        ``POST teams/<target_team_id>/roles/`` with the resolved target Role id.
+        """
+        teams_dir = input_dir / "teams"
+        if not teams_dir.is_dir():
+            return 0
+
+        teams_base = get_endpoint("teams").rstrip("/")
+        applied = 0
+
+        for tf in sorted(teams_dir.glob("teams_*.json")):
+            try:
+                with open(tf) as f:
+                    teams = json.load(f)
+            except Exception as e:
+                logger.warning("team_role_grants_file_read_failed", file=str(tf), error=str(e))
+                continue
+            for team in teams:
+                grants = team.get("_team_role_grants") or []
+                if not grants:
+                    continue
+                sid = team.get("_source_id")
+                if sid is None:
+                    continue
+                try:
+                    sid = int(sid)
+                except (TypeError, ValueError):
+                    continue
+                target_team_id = self.state.get_mapped_id("teams", sid)
+                if not target_team_id:
+                    logger.warning("team_role_grants_skip_unmapped_team", source_team_id=sid)
+                    continue
+                for g in grants:
+                    rname = str(g.get("role_name", "")).strip()
+                    raw_ct = g.get("content_resource_type")
+                    if raw_ct is None or str(raw_ct).strip() == "":
+                        continue
+                    ctype = normalize_resource_type(str(raw_ct).strip())
+                    try:
+                        csid = int(g.get("content_source_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    target_resource_id = self.state.get_mapped_id(ctype, csid)
+                    if not target_resource_id:
+                        logger.warning(
+                            "team_role_grants_skip_unmapped_resource",
+                            team_source_id=sid,
+                            content_resource_type=ctype,
+                            content_source_id=csid,
+                        )
+                        continue
+                    target_role_id = await self._resolve_target_role_id(
+                        ctype, target_resource_id, rname
+                    )
+                    if not target_role_id:
+                        continue
+                    try:
+                        await self.client.post(
+                            f"{teams_base}/{target_team_id}/roles/",
+                            json_data={"id": target_role_id},
+                        )
+                        applied += 1
+                    except ConflictError:
+                        applied += 1
+                    except Exception as e:
+                        logger.warning(
+                            "team_role_grant_post_failed",
+                            target_team_id=target_team_id,
+                            target_role_id=target_role_id,
+                            error=str(e),
+                        )
+
+        logger.info("team_resource_role_grants_applied", count=applied)
+        return applied
 
 
 class OrganizationImporter(ResourceImporter):

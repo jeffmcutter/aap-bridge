@@ -2069,6 +2069,46 @@ class UserExporter(ResourceExporter):
 class TeamExporter(ResourceExporter):
     """Exporter for team resources."""
 
+    async def _process_resource(
+        self, resource: dict[str, Any], resource_type: str
+    ) -> dict[str, Any] | None:
+        """Attach role grants where this team is the principal (via ``teams/<id>/roles/``).
+
+        These are distinct from membership in the team (``users/<id>/teams/``). They are
+        applied on import with ``POST teams/<id>/roles/`` after target resources exist.
+        """
+        from aap_migration.migration.team_role_grants import parse_team_role_from_api
+
+        processed = await super()._process_resource(resource, resource_type)
+        if not processed:
+            return None
+
+        team_id = processed.get("id")
+        if not team_id:
+            return processed
+
+        grants: list[dict[str, str | int]] = []
+        try:
+            roles = await self.client.get_paginated(
+                f"teams/{team_id}/roles/",
+                page_size=self.performance_config.batch_sizes.get("teams", 200),
+            )
+        except Exception as e:
+            logger.warning(
+                "team_roles_list_fetch_failed",
+                team_id=team_id,
+                error=str(e),
+            )
+            roles = []
+
+        for role in roles:
+            parsed = parse_team_role_from_api(role, team_source_id=int(team_id))
+            if parsed:
+                grants.append(parsed)
+
+        processed["_team_role_grants"] = grants
+        return processed
+
     async def export(
         self, filters: dict[str, Any] | None = None
     ) -> AsyncGenerator[dict[str, Any], None]:
