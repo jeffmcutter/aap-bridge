@@ -58,7 +58,7 @@ aap-bridge prep [OPTIONS]
 Export resources from source AAP.
 
 ```bash
-aap-bridge export [OPTIONS] [RESOURCE_TYPES]
+aap-bridge export [OPTIONS]
 
 ```
 
@@ -68,8 +68,8 @@ aap-bridge export [OPTIONS] [RESOURCE_TYPES]
 # Export all resources
 aap-bridge export
 
-# Export specific resource types
-aap-bridge export organizations inventories hosts
+# Export specific resource types (repeat -r for each type)
+aap-bridge export -r organizations -r inventories -r hosts
 
 # Export with custom output directory
 aap-bridge export --output ./my-exports/
@@ -84,6 +84,7 @@ aap-bridge export --records-per-file 500
 | Option | Description |
 | --- | --- |
 | `--output`, `-o` | Output directory (default: ./exports) |
+| `--resource-type`, `-r` | Resource type to export; repeat the option to select multiple types. Defaults to all available types. |
 | `--records-per-file` | Records per split file (default: 1000) |
 | `--force` | Overwrite existing exports |
 
@@ -94,7 +95,7 @@ aap-bridge export --records-per-file 500
 Transform exported data for target AAP.
 
 ```bash
-aap-bridge transform [OPTIONS] [RESOURCE_TYPES]
+aap-bridge transform [OPTIONS]
 
 ```
 
@@ -105,7 +106,7 @@ aap-bridge transform [OPTIONS] [RESOURCE_TYPES]
 aap-bridge transform
 
 # Transform specific types
-aap-bridge transform inventories hosts
+aap-bridge transform -r inventories -r hosts
 
 ```
 
@@ -115,6 +116,7 @@ aap-bridge transform inventories hosts
 | --- | --- |
 | `--input`, `-i` | Input directory (default: ./exports) |
 | `--output`, `-o` | Output directory (default: ./transformed) |
+| `--resource-type`, `-r` | Resource type to transform; repeat the option to select multiple types. Defaults to all exported types. |
 
 ---
 
@@ -123,7 +125,7 @@ aap-bridge transform inventories hosts
 Import data to target AAP.
 
 ```bash
-aap-bridge import [OPTIONS] [RESOURCE_TYPES]
+aap-bridge import [OPTIONS]
 
 ```
 
@@ -134,7 +136,7 @@ aap-bridge import [OPTIONS] [RESOURCE_TYPES]
 aap-bridge import
 
 # Import specific types
-aap-bridge import organizations inventories
+aap-bridge import -r organizations -r inventories
 
 # Import with progress disabled (CI/CD)
 aap-bridge import --disable-progress
@@ -146,6 +148,7 @@ aap-bridge import --disable-progress
 | Option | Description |
 | --- | --- |
 | `--input`, `-i` | Input directory |
+| `--resource-type`, `-r` | Resource type to import; repeat the option to select multiple types. Defaults to all transformed types. |
 | `--disable-progress` | Disable live progress display |
 | `--dry-run` | Simulate without making changes |
 
@@ -218,7 +221,7 @@ aap-bridge validate --sample-size 1000
 Run migration operations.
 
 ```bash
-aap-bridge migrate SUBCOMMAND [OPTIONS]
+aap-bridge migrate [OPTIONS]
 
 ```
 
@@ -231,10 +234,39 @@ aap-bridge migrate
 # Resume from checkpoint
 aap-bridge migrate resume
 
-# Resume from specific checkpoint
-aap-bridge migrate resume --checkpoint inventories_batch_50
+# Resume from a specific migration phase
+aap-bridge migrate resume --from-phase inventories
+
+# Run only selected resource types through export, transform, and import
+aap-bridge migrate -r organizations -r projects -r inventories
 
 ```
+
+### Selecting resource types
+
+`export`, `transform`, `import`, and `migrate` accept a repeatable
+`--resource-type` (`-r`) option. Supplying one or more values makes the command
+operate only on those resource types; omitting the option uses the command's
+default set.
+
+For example, to migrate content while retaining users and teams that already
+exist on the target, provide an allow-list that does not contain `users` or
+`teams`:
+
+```bash
+aap-bridge migrate \
+  -r organizations \
+  -r projects \
+  -r inventories \
+  -r job_templates \
+  -r workflow_job_templates
+```
+
+This selects only the listed types; it is not an exclusion option. When leaving
+out users or teams, also leave out `role_user_assignments` and
+`role_team_assignments`, because those assignments cannot be resolved without
+the corresponding identities on the target. A first-class resource-exclusion
+option is tracked in [issue #182](https://github.com/redhat-cop/aap-bridge/issues/182).
 
 ---
 

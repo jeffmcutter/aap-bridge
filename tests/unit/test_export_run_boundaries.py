@@ -58,8 +58,8 @@ def test_run_context_fingerprint_change(run_context: ExportRunContext) -> None:
 
 
 @pytest.mark.asyncio
-async def test_export_clears_stale_mappings(tmp_path: Path) -> None:
-    """Test that non-resume export clears stale mappings for specified types."""
+async def test_export_selects_only_explicit_resource_types(tmp_path: Path) -> None:
+    """A repeated -r allow-list must not add unselected resource types."""
     from aap_migration.cli.commands.export_import import export
 
     mock_ctx = MagicMock()
@@ -75,17 +75,22 @@ async def test_export_clears_stale_mappings(tmp_path: Path) -> None:
         with patch("aap_migration.cli.commands.export_import.requires_config", lambda x: x):
             with patch("aap_migration.cli.commands.export_import.handle_errors", lambda x: x):
                 runner = CliRunner()
-                # Run export for specific type
+                # Run export for an explicit allow-list.
                 with patch(
                     "aap_migration.cli.commands.export_import.asyncio.run",
                     side_effect=lambda coro: coro.close(),
                 ):
-                    runner.invoke(export, ["-r", "organizations", "--yes"], obj=mock_ctx)
+                    result = runner.invoke(
+                        export,
+                        ["-r", "organizations", "-r", "projects", "--yes"],
+                        obj=mock_ctx,
+                    )
 
-                # Check that clear_mappings was called for the requested type
-                mock_ctx.migration_state.clear_mappings.assert_any_call(
-                    "organizations", phase="export"
-                )
+    assert result.exit_code == 0, result.output
+    assert mock_ctx.migration_state.clear_mappings.call_args_list == [
+        (("organizations",), {"phase": "export"}),
+        (("projects",), {"phase": "export"}),
+    ]
 
 
 def test_migration_state_get_all_resource_types() -> None:
